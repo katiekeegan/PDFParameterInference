@@ -2,6 +2,7 @@ import torch
 import matplotlib.pyplot as plt
 import numpy as np
 
+
 def plot_dist(
     samples,
     plot_Gaussian=True,
@@ -51,6 +52,7 @@ def plot_dist(
     plt.draw()
     plt.pause(0.1)
 
+
 def plot_scatter(
     samples,
     plot_Gaussian=True,
@@ -58,12 +60,12 @@ def plot_scatter(
     axes=None,
     plot_other_data=False,
     other_data=None,
-    loglog = False
+    loglog=False,
 ):
     num_dimensions = samples.shape[1]
     num_rows = min(2, num_dimensions)
     num_cols = (num_dimensions + num_rows - 1) // num_rows
-
+    loglog = False
     if fig is None:
         fig = plt.figure(figsize=(8, 3 * num_rows))
     else:
@@ -72,12 +74,12 @@ def plot_scatter(
     plt.scatter(samples[..., 0], samples[..., 1], alpha=0.5, label="Generated Points")
     if plot_other_data == True:
         plt.scatter(
-            other_data[..., 0], other_data[..., 1], alpha=0.5, label="True Points"
+            other_data[..., 0], other_data[..., 1], alpha=0.1, label="True Points"
         )
     if loglog:
         # Set the scales of the x and y axes to logarithmic
-        plt.xscale('log')
-        plt.yscale('log')
+        plt.xscale("log")
+        plt.yscale("log")
     plt.xlabel("$\log(x)$")
     plt.ylabel("$\log(Q^{2})$")
     plt.legend()
@@ -85,9 +87,13 @@ def plot_scatter(
     # plt.draw()
     # plt.pause(0.1)
 
-def plot_params(means_over_epochs, std_devs_over_epochs, true_params, fig=None, axes=None):
+
+def plot_params(
+    means_over_epochs, std_devs_over_epochs, true_params, fig=None, axes=None
+):
     # fig.clf()
-    param_names = ['$N_{u}$', '$a_{u}$', '$b_{u}$', '$N_{d}$', '$a_{d}$', '$b_{d}$']
+    # param_names = ['$N_{u}$', '$a_{u}$', '$b_{u}$', '$N_{d}$', '$a_{d}$', '$b_{d}$']
+    param_names = list(range(33))
     num_epochs = len(means_over_epochs)
     num_params = len(means_over_epochs[0])
 
@@ -115,13 +121,13 @@ def plot_params(means_over_epochs, std_devs_over_epochs, true_params, fig=None, 
             range(num_epochs),
             means_over_epochs[:, i],
             yerr=std_devs_over_epochs[:, i],
-            fmt='-o',
-            label=f'Parameter {i+1}'
+            fmt="-o",
+            label=f"Parameter {i+1}",
         )
-        ax.axhline(true_params[i], color='r', linestyle='--', label='True Value')
+        ax.axhline(true_params[i], color="r", linestyle="--", label="True Value")
         ax.set_title(param_names[i])
-        ax.set_xlabel('Step')
-        ax.set_ylabel('Value')
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Value")
         # ax.legend()
 
     # Hide any empty subplots

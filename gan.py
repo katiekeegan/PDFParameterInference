@@ -12,37 +12,100 @@ from sampler import *
 from generator_plotting import *
 import sys
 
-sys.path.append('theory/jamlib/')
+sys.path.append("theory/jamlib/")
 
 
 import csv
 import params as par
 import cfg
-from alphaS  import ALPHAS
-from eweak   import EWEAK
-from pdf     import PDF
-from mellin  import MELLIN
-from idis    import THEORY
-from mceg    import MCEG
-
-def min_max_normalize(data, max, min):
-    return (data - min) / (max- min)
+from alphaS import ALPHAS
+from eweak import EWEAK
+from pdf import PDF
+from mellin import MELLIN
+from idis import THEORY
+from mceg import MCEG
 
 # Turn interactive mode off
+
 plt.ioff()
-# theory_cfg = {
-#     "parmin": [ -2,   0, -10, -10,  -1,   0, -10, -10,  -1,   0, -10, -10, -10,
-#         -2,   0, -10,  -2,   0, -10,  -2,   0, -10, -10, -10,  -2,   0,
-#        -10, -10,  -2,   0, -10,  -2,   0],
-#     "parmax":[ 10,  10, -10, -10,  10,  10, -10, -10,  10,  10, -10, -10,  10,
-#         10,  10,  10,  10,  10,  10,  10,  10, -10, -10,  10,  10,  10,
-#        -10, -10,  10,  10,  10,  10,  10],
-# }
 
 theory_cfg = {
-    "parmin": [0.0, -1.0, 0.0, 0.0, -1.0, 0.0],
-    "parmax": [3.0, 1.0, 5.0, 3.0, 1.0, 5.0],
+    "parmin": [
+        -2,
+        0,
+        -10,
+        -10,
+        -1,
+        0,
+        -10,
+        -10,
+        -1,
+        0,
+        -10,
+        -10,
+        -10,
+        -2,
+        0,
+        -10,
+        -2,
+        0,
+        -10,
+        -2,
+        0,
+        -10,
+        -10,
+        -10,
+        -2,
+        0,
+        -10,
+        -10,
+        -2,
+        0,
+        -10,
+        -2,
+        0,
+    ],
+    "parmax": [
+        10,
+        10,
+        -10,
+        -10,
+        10,
+        10,
+        -10,
+        -10,
+        10,
+        10,
+        -10,
+        -10,
+        10,
+        10,
+        10,
+        10,
+        10,
+        10,
+        10,
+        10,
+        10,
+        -10,
+        -10,
+        10,
+        10,
+        10,
+        -10,
+        -10,
+        10,
+        10,
+        10,
+        10,
+        10,
+    ],
 }
+
+# theory_cfg = {
+#     "parmin": [0.0, -1.0, 0.0, 0.0, -1.0, 0.0],
+#     "parmax": [3.0, 1.0, 5.0, 3.0, 1.0, 5.0],
+# }
 
 
 def train_loop(
@@ -53,7 +116,6 @@ def train_loop(
     G_Optimizer,
     D_Optimizer,
     S_Optimizer,
-    scheduler,
     args,
     G_losses,
     D_losses,
@@ -65,7 +127,7 @@ def train_loop(
     device,
     tparams,
     dataset,
-    filename
+    filename,
 ):
     data = data.to(device)
     if len(data.size()) < 3:
@@ -84,7 +146,10 @@ def train_loop(
         gen_data = torch.Tensor([]).to(device)
         for i in range(args.batch_size):
             gen_data_i = generate_synthetic_data(
-                gen_params[i, :], args.sample_size, option=args.distribution, device=device
+                gen_params[i, :],
+                args.sample_size,
+                option=args.distribution,
+                device=device,
             ).float()
 
             gen_data = torch.cat((gen_data, gen_data_i.unsqueeze(0)), dim=0).to(device)
@@ -96,7 +161,6 @@ def train_loop(
         gen_data = gen_data
         # check how D does with true data
         tlabels = torch.ones(data.size(0), 1).to(device)
-        # data = min_max_normalize(data, data.max(), data.min())
         toutput = Discriminator(torch.squeeze(data))
         # # calculate loss on true events
         tloss = criterion(toutput.squeeze(), tlabels.squeeze())
@@ -109,33 +173,36 @@ def train_loop(
             return
         # calculate loss on fake events
         floss = criterion(foutput.squeeze().float(), flabels.squeeze())
-        D_loss = tloss + floss
+        D_loss = tloss + floss  # + torch.norm(gen_data.mean()-data.mean())
         D_losses.append(D_loss.detach().cpu().item())
         D_loss.backward()
         if torch.isnan(D_loss).any():
             print(f"NaN detected in D_loss")
             return
         D_Optimizer.step()
-        for j in range(args.S_steps):
+        for j in range(1):
             S_Optimizer.zero_grad()
-            z = torch.randn(args.batch_size, args.noise_dim).to(device)
-            if torch.isnan(data).any():
-                print("NaN detected in input data")
-                return
-            gen_params = Generator(z)
-            gen_data = torch.Tensor([]).to(device)
-            for i in range(args.batch_size):
-                gen_data_i = generate_synthetic_data(
-                    gen_params[i, :], args.sample_size, device, option=args.distribution
-                ).float()
+            # z = torch.randn(args.batch_size, args.noise_dim).to(device)
+            # if torch.isnan(data).any():
+            #     print("NaN detected in input data")
+            #     return
+            # gen_params = Generator(z)
+            # gen_data = torch.Tensor([]).to(device)
+            # for i in range(args.batch_size):
+            #     gen_data_i = generate_synthetic_data(
+            #         gen_params[i, :], args.sample_size, device, option=args.distribution
+            #     ).float()
 
-                gen_data = torch.cat((gen_data, gen_data_i.unsqueeze(0)), dim=0).to(
-                    device
-                )
-            gen_data = gen_data
-            foutput = Discriminator(torch.squeeze(gen_data))
+            #     gen_data = torch.cat((gen_data, gen_data_i.unsqueeze(0)), dim=0).to(
+            #         device
+            #     )
+            # gen_data = gen_data
+            # foutput = Discriminator(torch.squeeze(gen_data))
             surrogate_floss = SurrogatePhysics(gen_params)
-            S_loss = surrogate_criterion(surrogate_floss.squeeze(), foutput.squeeze())
+            foutput = Discriminator(torch.squeeze(gen_data))
+            S_loss = surrogate_criterion(
+                surrogate_floss.squeeze(), foutput.squeeze().detach()
+            )
             S_losses.append(S_loss.detach().cpu().item())
             S_loss.backward()
             torch.nn.utils.clip_grad_norm_(SurrogatePhysics.parameters(), max_norm=1.0)
@@ -155,9 +222,15 @@ def train_loop(
         # magnitude_loss = torch.exp(torch.mean((real_x - gen_x) ** 2 + (real_y - gen_y) ** 2))-1
         G_loss = (
             G_criterion(G_output.squeeze(), tlabels.squeeze())
-            + 0.05* torch.sum(torch.relu(gen_params - torch.Tensor(theory_cfg["parmax"]).to(device)))
+            + 0.005
+            * torch.sum(
+                torch.relu(gen_params - torch.Tensor(theory_cfg["parmax"]).to(device))
+            )
             / len(gen_params)
-            + 0.05 * torch.sum(torch.relu(torch.Tensor(theory_cfg["parmin"]).to(device) - gen_params))
+            + 0.005
+            * torch.sum(
+                torch.relu(torch.Tensor(theory_cfg["parmin"]).to(device) - gen_params)
+            )
             / len(gen_params)
         )
 
@@ -186,7 +259,9 @@ def train_loop(
         (f_predicted == flabels.squeeze()).sum().item() / flabels.size(0)
     ) + 0.5 * ((t_predicted == tlabels.squeeze()).sum().item() / tlabels.size(0))
     D_accuracies.append(D_accuracy)
-    G_accuracy = torch.norm(tparams.to(device) - gen_params.mean(dim=0).to(device)) / torch.norm(tparams.to(device))
+    G_accuracy = torch.norm(
+        tparams.to(device) - gen_params.mean(dim=0).to(device)
+    ) / torch.norm(tparams.to(device))
     G_accuracies.append(G_accuracy.detach().cpu().item())
 
     print(f"Discriminator Accuracy: {D_accuracy}")
@@ -207,7 +282,7 @@ def train_loop(
         "Means": gen_params_means,
         "Variances": gen_params_variances,
     }
-    with open(filename+"training_metrics.json", "w") as f:
+    with open(filename + "training_metrics.json", "w") as f:
         json.dump(metrics, f)
 
     if args.plot == True:
@@ -219,14 +294,14 @@ def train_loop(
         gen_data = generate_synthetic_data(
             torch.tensor(gen_params_mean), 1024, device, option=args.distribution
         ).float()
-        # gen_data = torch.log(gen_data)
+        gen_data = gen_data
         plot_scatter(
             gen_data.detach().cpu().numpy(),
             fig=fig1,
             plot_Gaussian=False,
             plot_other_data=True,
             loglog=loglog,
-            other_data=dataset[0:1024, :].detach().cpu().numpy(),
+            other_data=dataset[:, :].detach().cpu().numpy(),
         )
         plt.legend()
         plt.tight_layout()
@@ -294,7 +369,7 @@ def main():
     )
     parser.add_argument(
         "--distribution",
-        default="theory",
+        default="jlab",
         help="True data distribution (default: exp)",
     )
     parser.add_argument(
@@ -318,7 +393,7 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=100,
+        default=10,
         help="input batch size for training (default: 3)",
     )
     parser.add_argument(
@@ -342,14 +417,14 @@ def main():
     parser.add_argument(
         "--D-steps",
         type=int,
-        default=1,
+        default=5,
         help="Number of discriminator model updates",
     )
 
     parser.add_argument(
         "--n-true-events",
         type=int,
-        default=10240,
+        default=102400,
         help="Number of true events for training (default: 10000)",
     )
     parser.add_argument(
@@ -395,23 +470,22 @@ def main():
 
     # Step 1: Check if a GPU is available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # device = torch.device("cpu")
     print(f"Using device: {device}")
     param_dims = sum(tensor.numel() for tensor in tparams)
     Generator = ConvolutionalGAN(args.noise_dim, param_dims).to(device)
-    Discriminator = MLP().to(device)  # PointDiscriminator(loglog).to(device)
+    Discriminator = MLP().to(device)
     SurrogatePhysics = SurrogatePhysicsModel(input_dim=param_dims).to(device)
 
-    G_Optimizer = optim.Adam(Generator.parameters(), lr=args.lr, betas=(0.5, 0.9999))
-    D_Optimizer = optim.Adam(
-        Discriminator.parameters(), lr=10 * args.lr, betas=(0.5, 0.9999)
-    )
-    S_Optimizer = optim.Adam(
-        SurrogatePhysics.parameters(), lr=args.lr, betas=(0.5, 0.9999)
-    )
+    def weights_init_he(m):
+        if isinstance(m, nn.Linear):
+            nn.init.kaiming_uniform_(m.weight, nonlinearity="relu")
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
 
-    # Learning Rate Scheduler
-    scheduler = StepLR(S_Optimizer, step_size=150, gamma=0.1)
+    Generator.apply(weights_init_he)  # Apply He initialization
+    G_Optimizer = optim.RMSprop(Generator.parameters(), lr=args.lr)
+    D_Optimizer = optim.RMSprop(Discriminator.parameters(), lr=args.lr)
+    S_Optimizer = optim.RMSprop(SurrogatePhysics.parameters(), lr=args.lr)
 
     dataset = (
         generate_synthetic_data(
@@ -433,11 +507,26 @@ def main():
     gen_params_variances = []
 
     shuffle_data = True
-    data_loader = DataLoader(dataset=dataset, batch_size=args.batch_size, shuffle=shuffle_data)
+    data_loader = DataLoader(
+        dataset=dataset, batch_size=args.batch_size, shuffle=shuffle_data
+    )
     Generator.train()
     Discriminator.train()
     SurrogatePhysics.train()
-    filename = 'lr' + str(args.lr) + 'noisedim' + str(args.noise_dim) + 'G' + str(args.G_steps) + 'D' + str(args.D_steps) + 'S' + str(args.S_steps) + 'n' + str(args.n_true_events)
+    filename = (
+        "lr"
+        + str(args.lr)
+        + "noisedim"
+        + str(args.noise_dim)
+        + "G"
+        + str(args.G_steps)
+        + "D"
+        + str(args.D_steps)
+        + "S"
+        + str(args.S_steps)
+        + "n"
+        + str(args.n_true_events)
+    )
     for epoch in range(args.epochs):
         print(f"Epoch {epoch}")
         for data in data_loader:
@@ -450,7 +539,6 @@ def main():
                 G_Optimizer,
                 D_Optimizer,
                 S_Optimizer,
-                scheduler,
                 args,
                 G_losses,
                 D_losses,
@@ -462,7 +550,7 @@ def main():
                 device,
                 tparams,
                 dataset,
-                filename
+                filename,
             )
 
     # torch.save(Generator.state_dict(), str(args.filename) + "model.pt")
