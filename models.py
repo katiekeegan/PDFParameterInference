@@ -10,8 +10,11 @@ class ConvolutionalGAN(nn.Module):
         # Encoder
         self.model = nn.Sequential(
             nn.Linear(noise_dim, 2 * noise_dim),
-            nn.ReLU(),
-            nn.Dropout(p=0.5),
+            nn.LeakyReLU(),
+            # nn.Dropout(p=0.5),
+            # nn.Linear(2 * noise_dim, 2 * noise_dim),
+            # nn.LeakyReLU(),
+            # nn.Dropout(p=0.5),
             nn.Linear(2 * noise_dim, int(param_dims)),
         )
 
@@ -49,11 +52,12 @@ class MLP(nn.Module):
         self.fc3 = nn.Linear(16, 1)
         self.sigmoid = nn.Sigmoid()  # Sigmoid activation for binary classification
         self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.3)
 
     def forward(self, x):
         x = x.float()
-        x = self.relu(self.fc1(x))
-        x = self.relu(self.fc2(x))  # Apply ReLU activation function
+        x = self.dropout(self.relu(self.fc1(x)))
+        x = self.dropout(self.relu(self.fc2(x)))  # Apply ReLU activation function
         x = self.fc3(x)
         x = self.sigmoid(x)  # Apply Sigmoid activation function
         return x

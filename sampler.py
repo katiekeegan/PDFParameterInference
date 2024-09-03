@@ -23,8 +23,6 @@ import torch.distributions as D
 import torch.nn.functional as F
 import torch.distributions as dist
 
-from ddpm_functions import *
-
 torch.autograd.set_detect_anomaly(True)
 
 tparams = torch.tensor([1])
@@ -32,29 +30,12 @@ torch.manual_seed(42)
 
 
 def generate_synthetic_data(
-    params, nevents, device=torch.device("cpu"), option="normal", mixes=2, mixed_dims=2
+    params, nevents, device=torch.device("cpu"), option="jlab"
 ):  # Function for generating synthetic data
     with torch.autograd.set_grad_enabled(True):
-        if option == "proxy_data" or option == "theory":
-            params = torch.unsqueeze(params, 0).to(device)
-            # Define a config for the theory module:
-            theory_cfg = {
-                "parmin": [0.0, -1.0, 0.0, 0.0, -1.0, 0.0],
-                "parmax": [3.0, 1.0, 5.0, 3.0, 1.0, 5.0],
-            }
-            # Load the theory module, we need something to predict some data...
-            proxy_theory = theories.make(
-                "torch_proxy_theory_v0", config=theory_cfg, devices=device
-            )
-            # Load the sampler:
-            sampler_cfg = {}
-            inv_proxy_sampler = samplers.make(
-                "torch_inv_proxy_sampler_v0", config=sampler_cfg, devices=device
-            )
-            sigma1, sigma2, norm1, norm2 = proxy_theory.forward(params)
-            events, norm1, norm2 = inv_proxy_sampler.forward(
-                sigma1, sigma2, norm1, norm2, nevents
-            )
+        if option == "mixture":
+            dist = torch.distributions.multivariate_normal.MultivariateNormal(params[0:2].to(device), torch.diag(torch.ones(2)).to(device))
+            events = dist.sample((int(nevents),1)).to(device)
         elif option == "jlab":
             mellin = MELLIN(npts=8)
             alphaS = ALPHAS()

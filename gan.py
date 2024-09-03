@@ -11,9 +11,9 @@ from models import *
 from sampler import *
 from generator_plotting import *
 import sys
+import concurrent
 
 sys.path.append("theory/jamlib/")
-
 
 import csv
 import params as par
@@ -28,85 +28,6 @@ from mceg import MCEG
 # Turn interactive mode off
 
 plt.ioff()
-
-theory_cfg = {
-    "parmin": [
-        -2,
-        0,
-        -10,
-        -10,
-        -1,
-        0,
-        -10,
-        -10,
-        -1,
-        0,
-        -10,
-        -10,
-        -10,
-        -2,
-        0,
-        -10,
-        -2,
-        0,
-        -10,
-        -2,
-        0,
-        -10,
-        -10,
-        -10,
-        -2,
-        0,
-        -10,
-        -10,
-        -2,
-        0,
-        -10,
-        -2,
-        0,
-    ],
-    "parmax": [
-        10,
-        10,
-        -10,
-        -10,
-        10,
-        10,
-        -10,
-        -10,
-        10,
-        10,
-        -10,
-        -10,
-        10,
-        10,
-        10,
-        10,
-        10,
-        10,
-        10,
-        10,
-        10,
-        -10,
-        -10,
-        10,
-        10,
-        10,
-        -10,
-        -10,
-        10,
-        10,
-        10,
-        10,
-        10,
-    ],
-}
-
-# theory_cfg = {
-#     "parmin": [0.0, -1.0, 0.0, 0.0, -1.0, 0.0],
-#     "parmax": [3.0, 1.0, 5.0, 3.0, 1.0, 5.0],
-# }
-
 
 def train_loop(
     data,
@@ -144,15 +65,20 @@ def train_loop(
             return
         gen_params = Generator(z)
         gen_data = torch.Tensor([]).to(device)
-        for i in range(args.batch_size):
+        def process_data(gen_params_i):
             gen_data_i = generate_synthetic_data(
-                gen_params[i, :],
-                args.sample_size,
-                option=args.distribution,
-                device=device,
-            ).float()
-
-            gen_data = torch.cat((gen_data, gen_data_i.unsqueeze(0)), dim=0).to(device)
+            gen_params_i,
+            args.sample_size,
+            option=args.distribution,
+            device=device,
+            ).float().unsqueeze(0)
+            return gen_data_i
+        gen_params_list = [gen_params[i, :] for i in np.arange(0,gen_params.size(0)).tolist()]
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            # Map the function to the data_list, distributing work across threads
+            gen_data = list(executor.map(process_data, gen_params_list))
+        gen_data = torch.cat(gen_data, dim=0)
+            # gen_data = torch.cat((gen_data, gen_data_i.unsqueeze(0)), dim=0).to(device)
         if torch.isnan(gen_data).any():
             print("NaN detected in gen_data")
             gen_data[torch.isnan(gen_data)] = 1e-8  # Replace NaN with 1.0
@@ -173,13 +99,17 @@ def train_loop(
             return
         # calculate loss on fake events
         floss = criterion(foutput.squeeze().float(), flabels.squeeze())
-        D_loss = tloss + floss  # + torch.norm(gen_data.mean()-data.mean())
+        #  torch.mean(critic(fake_data)) - torch.mean(critic(real_data))
+        D_loss = tloss + floss # + torch.norm(gen_data.mean()-data.mean())
         D_losses.append(D_loss.detach().cpu().item())
         D_loss.backward()
         if torch.isnan(D_loss).any():
             print(f"NaN detected in D_loss")
             return
         D_Optimizer.step()
+        # Weight clipping
+        # for p in Discriminator.parameters():
+        #     p.data.clamp_(-0.01, 0.01)
         for j in range(1):
             S_Optimizer.zero_grad()
             # z = torch.randn(args.batch_size, args.noise_dim).to(device)
@@ -220,9 +150,80 @@ def train_loop(
 
         # Penalize deviations in magnitude
         # magnitude_loss = torch.exp(torch.mean((real_x - gen_x) ** 2 + (real_y - gen_y) ** 2))-1
-        G_loss = (
-            G_criterion(G_output.squeeze(), tlabels.squeeze())
-            + 0.005
+        if args.distribution == 'jlab':
+            theory_cfg = {
+                "parmin": [
+                    -2,
+                    0,
+                    -10,
+                    -10,
+                    -1,
+                    0,
+                    -10,
+                    -10,
+                    -1,
+                    0,
+                    -10,
+                    -10,
+                    -10,
+                    -2,
+                    0,
+                    -10,
+                    -2,
+                    0,
+                    -10,
+                    -2,
+                    0,
+                    -10,
+                    -10,
+                    -10,
+                    -2,
+                    0,
+                    -10,
+                    -10,
+                    -2,
+                    0,
+                    -10,
+                    -2,
+                    0,
+                ],
+                "parmax": [
+                    10,
+                    10,
+                    -10,
+                    -10,
+                    10,
+                    10,
+                    -10,
+                    -10,
+                    10,
+                    10,
+                    -10,
+                    -10,
+                    10,
+                    10,
+                    10,
+                    10,
+                    10,
+                    10,
+                    10,
+                    10,
+                    10,
+                    -10,
+                    -10,
+                    10,
+                    10,
+                    10,
+                    -10,
+                    -10,
+                    10,
+                    10,
+                    10,
+                    10,
+                    10,
+                ],
+            }
+            range_loss = (0.005
             * torch.sum(
                 torch.relu(gen_params - torch.Tensor(theory_cfg["parmax"]).to(device))
             )
@@ -232,7 +233,12 @@ def train_loop(
                 torch.relu(torch.Tensor(theory_cfg["parmin"]).to(device) - gen_params)
             )
             / len(gen_params)
-        )
+            )
+        else: 
+            range_loss = 0
+
+        G_loss = G_criterion(G_output.squeeze(), tlabels.squeeze()) + range_loss
+
 
         print("G_loss")
 
@@ -282,7 +288,7 @@ def train_loop(
         "Means": gen_params_means,
         "Variances": gen_params_variances,
     }
-    with open(filename + "training_metrics.json", "w") as f:
+    with open('results/' + filename + "training_metrics.json", "w") as f:
         json.dump(metrics, f)
 
     if args.plot == True:
@@ -305,7 +311,7 @@ def train_loop(
         )
         plt.legend()
         plt.tight_layout()
-        plt.savefig(filename + "scatterplot.png")
+        plt.savefig("results/" + filename + "scatterplot.png")
         plt.draw()
         plt.pause(0.0001)
         plt.close()
@@ -318,7 +324,7 @@ def train_loop(
         ax.set_title("Training Loss")
         plt.legend()
         plt.tight_layout()
-        plt.savefig(filename + "G_losses.png")
+        plt.savefig("results/" + filename + "G_losses.png")
         plt.draw()
         plt.pause(0.0001)
         plt.close()
@@ -331,7 +337,7 @@ def train_loop(
         ax.set_title("Training Loss")
         plt.legend()
         plt.tight_layout()
-        plt.savefig(filename + "D_losses.png")
+        plt.savefig("results/" + filename + "D_losses.png")
         plt.draw()
         plt.pause(0.0001)
         plt.close()
@@ -344,7 +350,7 @@ def train_loop(
         ax.set_title("Training Loss")
         plt.legend()
         plt.tight_layout()
-        plt.savefig(filename + "S_losses.png")
+        plt.savefig("results/" + filename + "S_losses.png")
         plt.draw()
         plt.pause(0.0001)
         plt.close()
@@ -352,7 +358,7 @@ def train_loop(
         plt.clf()
         plot_params(gen_params_means, gen_params_variances, tparams, fig=fig5)
         plt.tight_layout()
-        plt.savefig(filename + "parameters.png")
+        plt.savefig("results/" + filename + "parameters.png")
         plt.draw()
         plt.pause(0.0001)
         plt.close()
@@ -365,7 +371,7 @@ def main():
         description="Diffusion Denoising Model for Probability Distribution Parameter Estimation"
     )
     parser.add_argument(
-        "--noise-dim", type=int, default=64, help="Noise dimension size (default: 100)"
+        "--noise-dim", type=int, default=32, help="Noise dimension size (default: 100)"
     )
     parser.add_argument(
         "--distribution",
@@ -393,7 +399,7 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=10,
+        default=32,
         help="input batch size for training (default: 3)",
     )
     parser.add_argument(
@@ -417,14 +423,14 @@ def main():
     parser.add_argument(
         "--D-steps",
         type=int,
-        default=5,
+        default=3,
         help="Number of discriminator model updates",
     )
 
     parser.add_argument(
         "--n-true-events",
         type=int,
-        default=102400,
+        default=10240,
         help="Number of true events for training (default: 10000)",
     )
     parser.add_argument(
@@ -436,28 +442,8 @@ def main():
     args = parser.parse_args()
 
     # Set true parameters
-    if args.distribution == "normal":
-        mu = 1.6  # true mean of Gaussian
-        std = 0.8  # true std of Gaussian
-        tparams = torch.tensor([mu, std])
-    elif args.distribution == "exp":
-        rate = 2  # true rate of exponential distribution
-        tparams = torch.tensor([rate])
-    elif args.distribution == "mixture":
-        rate = 2  # true rate of exponential distribution
-        tparams = torch.tensor([rate])
-    elif args.distribution == "multidimensional":
-        rate = 2  # true rate of exponential distribution
-        tparams = torch.tensor([rate])
-    elif args.distribution == "2D":
-        rate = 2  # true rate of exponential distribution
-        tparams = torch.tensor([rate])
-    elif args.distribution == "mixed":
-        tparams = torch.rand(
-            2, 2
-        ).ravel()  # torch.abs(torch.cat([torch.randn(5, 2).ravel(), torch.rand(5, 2).ravel()]))
-    elif args.distribution == "theory":
-        tparams = torch.tensor([0.72916667, 0.25, 0.6, 0.36458333, 0.25, 0.8])
+    if args.distribution == "mixture":
+        tparams = torch.rand(2)+3 # torch.abs(torch.cat([torch.randn(5, 2).ravel(), torch.rand(5, 2).ravel()]))
     elif args.distribution == "jlab":
         mellin = MELLIN(npts=8)
         alphaS = ALPHAS()
