@@ -4,26 +4,18 @@ import json
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import StepLR
-import matplotlib
 import numpy as np
 from models import *
 from sampler import *
-from generator_plotting import *
+from plotting import *
 import sys
 import concurrent
-
+import torch.optim as optim
 sys.path.append("theory/jamlib/")
 
-import csv
-import params as par
-import cfg
 from alphaS import ALPHAS
-from eweak import EWEAK
 from pdf import PDF
 from mellin import MELLIN
-from idis import THEORY
-from mceg import MCEG
 
 # Turn interactive mode off
 
@@ -78,6 +70,11 @@ def train_loop(
             # Map the function to the data_list, distributing work across threads
             gen_data = list(executor.map(process_data, gen_params_list))
         gen_data = torch.cat(gen_data, dim=0)
+        # gen_params_mean = gen_params.mean(dim=0).detach().cpu().numpy().tolist()
+        # gen_data = generate_synthetic_data(
+        #     torch.tensor(gen_params.mean(dim=0).detach().cpu().numpy().tolist()).to(device), args.batch_size, device, option=args.distribution
+        # ).float()
+        # breakpoint()
             # gen_data = torch.cat((gen_data, gen_data_i.unsqueeze(0)), dim=0).to(device)
         if torch.isnan(gen_data).any():
             print("NaN detected in gen_data")
@@ -87,17 +84,20 @@ def train_loop(
         gen_data = gen_data
         # check how D does with true data
         tlabels = torch.ones(data.size(0), 1).to(device)
+        print("DATA SIZE")
+        print(data.size())
         toutput = Discriminator(torch.squeeze(data))
         # # calculate loss on true events
         tloss = criterion(toutput.squeeze(), tlabels.squeeze())
-
         # check how D does with fake data generated from fake parameters
-        flabels = torch.zeros(gen_data.size(0), 1).to(device)
+        flabels = torch.zeros(args.batch_size, 1).to(device)
         foutput = Discriminator(torch.squeeze(gen_data))
         if torch.isnan(foutput).any():
             print("NaN detected in Discriminator output")
             return
         # calculate loss on fake events
+        print(foutput.size())
+        # breakpoint()
         floss = criterion(foutput.squeeze().float(), flabels.squeeze())
         #  torch.mean(critic(fake_data)) - torch.mean(critic(real_data))
         D_loss = tloss + floss # + torch.norm(gen_data.mean()-data.mean())
@@ -110,24 +110,42 @@ def train_loop(
         # Weight clipping
         # for p in Discriminator.parameters():
         #     p.data.clamp_(-0.01, 0.01)
-        for j in range(1):
-            S_Optimizer.zero_grad()
+        # for j in range(args.S_steps):
+        # S_Optimizer.zero_grad()
+        # z = torch.randn(args.batch_size*args.S_steps, args.noise_dim).to(device)
+        # if torch.isnan(data).any():
+        #     print("NaN detected in input data")
+        #     return
+        # gen_params = Generator(z)
+        # gen_data = torch.Tensor([]).to(device)
+        # for i in range(args.batch_size):
+        #     gen_data_i = generate_synthetic_data(
+        #         gen_params[i, :], args.sample_size, device, option=args.distribution
+        #     ).float()
+
+        #     gen_data = torch.cat((gen_data, gen_data_i.unsqueeze(0)), dim=0).to(
+        #         device
+        #     )
+        # gen_data = gen_data
+        # foutput = Discriminator(torch.squeeze(gen_data))
+        # breakpoint()
+        for _ in range(args.S_steps):
             # z = torch.randn(args.batch_size, args.noise_dim).to(device)
-            # if torch.isnan(data).any():
-            #     print("NaN detected in input data")
-            #     return
             # gen_params = Generator(z)
             # gen_data = torch.Tensor([]).to(device)
-            # for i in range(args.batch_size):
+            # def process_data(gen_params_i):
             #     gen_data_i = generate_synthetic_data(
-            #         gen_params[i, :], args.sample_size, device, option=args.distribution
-            #     ).float()
-
-            #     gen_data = torch.cat((gen_data, gen_data_i.unsqueeze(0)), dim=0).to(
-            #         device
-            #     )
-            # gen_data = gen_data
-            # foutput = Discriminator(torch.squeeze(gen_data))
+            #     gen_params_i,
+            #     args.sample_size,
+            #     option=args.distribution,
+            #     device=device,
+            #     ).float().unsqueeze(0)
+            #     return gen_data_i
+            # gen_params_list = [gen_params[i, :] for i in np.arange(0,gen_params.size(0)).tolist()]
+            # with concurrent.futures.ThreadPoolExecutor() as executor:
+            #     # Map the function to the data_list, distributing work across threads
+            #     gen_data = list(executor.map(process_data, gen_params_list))
+            # gen_data = torch.cat(gen_data, dim=0)
             surrogate_floss = SurrogatePhysics(gen_params)
             foutput = Discriminator(torch.squeeze(gen_data))
             S_loss = surrogate_criterion(
@@ -135,7 +153,7 @@ def train_loop(
             )
             S_losses.append(S_loss.detach().cpu().item())
             S_loss.backward()
-            torch.nn.utils.clip_grad_norm_(SurrogatePhysics.parameters(), max_norm=1.0)
+            # torch.nn.utils.clip_grad_norm_(SurrogatePhysics.parameters(), max_norm=1.0)
             S_Optimizer.step()
 
     for _ in range(args.G_steps):
@@ -145,8 +163,6 @@ def train_loop(
         # obtain fake loss
         G_output = SurrogatePhysics(gen_params)
         tlabels = torch.ones(G_output.size(0), 1).to(device)
-        real_x, real_y = data[..., 0], data[..., 1]
-        gen_x, gen_y = gen_data[..., 0], gen_data[..., 1]
 
         # Penalize deviations in magnitude
         # magnitude_loss = torch.exp(torch.mean((real_x - gen_x) ** 2 + (real_y - gen_y) ** 2))-1
@@ -223,17 +239,18 @@ def train_loop(
                     10,
                 ],
             }
-            range_loss = (0.005
-            * torch.sum(
-                torch.relu(gen_params - torch.Tensor(theory_cfg["parmax"]).to(device))
-            )
-            / len(gen_params)
-            + 0.005
-            * torch.sum(
-                torch.relu(torch.Tensor(theory_cfg["parmin"]).to(device) - gen_params)
-            )
-            / len(gen_params)
-            )
+            # range_loss = (0.05
+            # * torch.sum(
+            #     torch.relu(gen_params - torch.Tensor(theory_cfg["parmax"]).to(device)[4:8])
+            # )
+            # / len(gen_params)
+            # + 0.05
+            # * torch.sum(
+            #     torch.relu(torch.Tensor(theory_cfg["parmin"]).to(device)[4:8] - gen_params)
+            # )
+            # / len(gen_params)
+            # )
+            range_loss = 0
         else: 
             range_loss = 0
 
@@ -298,16 +315,17 @@ def train_loop(
         if args.distribution == "jlab":
             loglog = True
         gen_data = generate_synthetic_data(
-            torch.tensor(gen_params_mean), 1024, device, option=args.distribution
+            torch.tensor(gen_params.mean(dim=0).detach().cpu().numpy().tolist()).to(device), 1024, device, option=args.distribution
         ).float()
-        gen_data = gen_data
+        # Select 1024 random indices
+        random_indices = np.random.choice(args.n_true_events, size=1024, replace=False)
         plot_scatter(
             gen_data.detach().cpu().numpy(),
             fig=fig1,
             plot_Gaussian=False,
             plot_other_data=True,
             loglog=loglog,
-            other_data=dataset[:, :].detach().cpu().numpy(),
+            other_data=dataset[random_indices].detach().cpu().numpy(),
         )
         plt.legend()
         plt.tight_layout()
@@ -387,7 +405,7 @@ def main():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=10,
+        default=10000,
         help="number of epochs to train (default: 10)",
     )
     parser.add_argument(
@@ -411,7 +429,7 @@ def main():
     parser.add_argument(
         "--S-steps",
         type=int,
-        default=5,
+        default=1,
         help="Number of surrogate physics model updates",
     )
     parser.add_argument(
@@ -430,7 +448,7 @@ def main():
     parser.add_argument(
         "--n-true-events",
         type=int,
-        default=10240,
+        default=102400,
         help="Number of true events for training (default: 10000)",
     )
     parser.add_argument(
@@ -448,7 +466,7 @@ def main():
         mellin = MELLIN(npts=8)
         alphaS = ALPHAS()
         pdf = PDF(mellin, alphaS)
-        tparams = torch.tensor(pdf.current_par)
+        tparams = torch.tensor(pdf.current_par)[4:8]
     # Set random seed for reproducibility
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
@@ -462,16 +480,16 @@ def main():
     Discriminator = MLP().to(device)
     SurrogatePhysics = SurrogatePhysicsModel(input_dim=param_dims).to(device)
 
-    def weights_init_he(m):
-        if isinstance(m, nn.Linear):
-            nn.init.kaiming_uniform_(m.weight, nonlinearity="relu")
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs")
+        Generator = torch.nn.DataParallel(Generator).to(device)
+        Discriminator = torch.nn.DataParallel(Discriminator).to(device)
+        SurrogatePhysics = torch.nn.DataParallel(SurrogatePhysics).to(device)
 
-    Generator.apply(weights_init_he)  # Apply He initialization
-    G_Optimizer = optim.RMSprop(Generator.parameters(), lr=args.lr)
-    D_Optimizer = optim.RMSprop(Discriminator.parameters(), lr=args.lr)
-    S_Optimizer = optim.RMSprop(SurrogatePhysics.parameters(), lr=args.lr)
+    # Generator.apply(weights_init_he)  # Apply He initialization
+    G_Optimizer = optim.Adam(Generator.parameters(), lr=args.lr)
+    D_Optimizer = optim.Adam(Discriminator.parameters(), lr=args.lr)
+    S_Optimizer = optim.Adam(SurrogatePhysics.parameters(), lr=args.lr)
 
     dataset = (
         generate_synthetic_data(
@@ -512,6 +530,8 @@ def main():
         + str(args.S_steps)
         + "n"
         + str(args.n_true_events)
+        + "seed"
+        + str(args.seed)
     )
     for epoch in range(args.epochs):
         print(f"Epoch {epoch}")
@@ -539,7 +559,7 @@ def main():
                 filename,
             )
 
-    # torch.save(Generator.state_dict(), str(args.filename) + "model.pt")
+    torch.save(Generator.state_dict(), filename + "model.pt")
 
 
 if __name__ == "__main__":
