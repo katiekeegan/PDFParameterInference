@@ -1,171 +1,200 @@
-
 import torch
 import torch.nn as nn
-from torch import cat
+import torch.optim as optim
+import torch.utils.data as data
 import torch.nn.functional as F
+import math
+from torch.nn.utils import spectral_norm as sn
+from torch.nn import MultiheadAttention
 
-class ConvolutionalGAN(nn.Module):
-    def __init__(self, noise_dim, param_dims):
-        super().__init__()
-        # Encoder
-        self.model = nn.Sequential(
-            nn.Linear(noise_dim, 16),
-            nn.LeakyReLU(),
-            # nn.Dropout(p=0.5),
-            nn.Linear(16, 16),
-            nn.LeakyReLU(),
-            # nn.Dropout(p=0.5),
-            # nn.Linear(32, 16),
-            # nn.LeakyReLU(),
-            nn.Linear(16, int(param_dims)),
-            nn.ReLU()
-        )
-    # Function to initialize weights with He initialization
-    def initialize_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+class ISAB(nn.Module):
+    def __init__(self, dim_in, dim_out, num_heads, num_inds, ln=False):
+        super(ISAB, self).__init__()
+        self.I = nn.Parameter(torch.Tensor(1, num_inds, dim_out))
+        nn.init.xavier_uniform_(self.I)
+        self.mab0 = MAB(dim_out, dim_in, dim_out, num_heads, ln=ln)
+        self.mab1 = MAB(dim_in, dim_out, dim_out, num_heads, ln=ln)
 
-    def forward(self, x):
-        x1 = x
-        x2 = self.model(x1)
-        # x2 = x2**2
-        # x2[...,0] = 5.5*nn.Tanh()(x2[...,0])+4.5
-        # x2[...,1] = 5*nn.Tanh()(x2[...,1])+5
-        # x2[...,2] = 5*nn.Tanh()(x2[...,2])+5
-        # x2[...,3] = 30*nn.Tanh()(x2[...,3])
-        return x2
+    def forward(self, X):
+        H = self.mab0(self.I.repeat(X.size(0), 1, 1), X)
+        return self.mab1(X, H)
 
-class SurrogatePhysicsModel(nn.Module):
-    def __init__(self, input_dim):
-        super(SurrogatePhysicsModel, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 32)  # First fully connected layer
-        self.fc2 = nn.Linear(32, 16)  # Second fully connected layer
-        self.fc3 = nn.Linear(16, 1)
-        self.dropout = nn.Dropout(0.5)
-        self.sigmoid = nn.Sigmoid()  # Sigmoid activation for binary classification
+class MAB(nn.Module):
+    def __init__(self, dim_Q, dim_K, dim_V, num_heads, ln=False):
+        super(MAB, self).__init__()
+        self.dim_V = dim_V
+        self.num_heads = num_heads
+        self.fc_q = nn.Linear(dim_Q, dim_V)
+        self.fc_k = nn.Linear(dim_K, dim_V)
+        self.fc_v = nn.Linear(dim_K, dim_V)
+        if ln:
+            self.ln0 = nn.LayerNorm(dim_V)
+            self.ln1 = nn.LayerNorm(dim_V)
+        self.fc_o = nn.Linear(dim_V, dim_V)
+        # with torch.no_grad():
+        #     self.fc_q.weight.mul_(0.67 * (4 * 6)**-0.25)  # L=6 blocks
+        #     self.fc_k.weight.mul_(0.67 * (4 * 6)**-0.25)
+        #     self.fc_v.weight.mul_(0.67 * (4 * 6)**-0.25)
+        #     self.fc_o.weight.zero_()  # Zero-init final layer
 
-    # Function to initialize weights with He initialization
-    def initialize_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+    def forward(self, Q, K):
+        # identity = Q
+        Q = self.fc_q(Q)
+        K, V = self.fc_k(K), self.fc_v(K)
 
-    def forward(self, x):
-        x = x.float()
-        x = torch.relu(self.fc1(x))  # Apply ReLU activation function
-        x = self.dropout(x)
-        x = torch.relu(self.fc2(x))  # Apply ReLU activation function
-        x = self.dropout(x)
-        x = self.fc3(x)
-        x = self.sigmoid(x)  # Apply Sigmoid activation function
-        return x
+        dim_split = self.dim_V // self.num_heads
+        Q_ = torch.cat(Q.split(dim_split, 2), 0)
+        K_ = torch.cat(K.split(dim_split, 2), 0)
+        V_ = torch.cat(V.split(dim_split, 2), 0)
 
+        A = torch.softmax(Q_.bmm(K_.transpose(1,2))/math.sqrt(self.dim_V), 2)
+        O = torch.cat((Q_ + A.bmm(V_)).split(Q.size(0), 0), 2)
+        O = O if getattr(self, 'ln0', None) is None else self.ln0(O)
+        O = O + F.relu(self.fc_o(O))
+        O = O if getattr(self, 'ln1', None) is None else self.ln1(O)
+        return O
 
-class MLP(nn.Module):
-    def __init__(self, input_dim=1):
-        super(MLP, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 16)  # First fully connected layer
-        self.fc2 = nn.Linear(16, 8)  # Second fully connected layer
-        self.fc3 = nn.Linear(8, 1)
-        self.sigmoid = nn.Sigmoid()  # Sigmoid activation for binary classification
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(0.5)
-            # Function to initialize weights with He initialization
-    def initialize_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+class SAB(nn.Module):
+    def __init__(self, dim_in, dim_out, num_heads, ln=False):
+        super(SAB, self).__init__()
+        self.mab = MAB(dim_in, dim_in, dim_out, num_heads, ln=ln)
 
+    def forward(self, X):
+        return self.mab(X, X)
 
-    def forward(self, x):
-        x = x.float()
-        x = self.relu(self.fc1(x))
-        x = self.relu(self.fc2(x))  # Apply ReLU activation function
-        x = self.fc3(x)
-        x = self.sigmoid(x)  # Apply Sigmoid activation function
-        return x
+class PMA(nn.Module):
+    def __init__(self, dim, num_heads, num_seeds, ln=False):
+        super(PMA, self).__init__()
+        self.S = nn.Parameter(torch.Tensor(1, num_seeds, dim))
+        nn.init.xavier_uniform_(self.S)
+        self.mab = MAB(dim, dim, dim, num_heads, ln=ln)
 
-class SelfAttention(nn.Module):
-    def __init__(self, hidden_dim, num_heads):
-        super(SelfAttention, self).__init__()
-        self.attention = nn.MultiheadAttention(hidden_dim, num_heads)
-        self.norm = nn.LayerNorm(hidden_dim)
+    def forward(self, X):
+        return self.mab(self.S.repeat(X.size(0), 1, 1), X)
+
+class SetTransformer(nn.Module):
+    def __init__(self, input_dim=4, output_dim=4, hidden_dim=32, num_heads=2, num_inds=512, ln=False):
+        super(SetTransformer, self).__init__()
+
+        self.enc = nn.Sequential(
+                ISAB(4, hidden_dim, 2, num_inds, ln=ln),
+                ISAB(hidden_dim, hidden_dim, 1, num_inds, ln=ln))
+        self.dec = nn.Sequential(
+                PMA(hidden_dim, 1, 1, ln=ln),
+                SAB(hidden_dim, hidden_dim, 1, ln=ln),
+                SAB(hidden_dim, hidden_dim, num_heads, ln=ln),
+                nn.Linear(hidden_dim, output_dim))
 
     def forward(self, x):
-        # Transpose for multihead attention (batch_first=False for nn.MultiheadAttention)
-        x = x.transpose(0, 1)  # Shape: (set_size, batch_size, hidden_dim)
-        attn_output, _ = self.attention(x, x, x)
-        x = self.norm(x + attn_output)
-        return x.transpose(0, 1)  # Shape: (batch_size, set_size, hidden_dim)
-class DeepSetsWithAttention(nn.Module):
-    def __init__(self, batch_size=5,input_dim=1, hidden_dim=8, output_dim=1, num_heads=4):
-        super(DeepSetsWithAttention, self).__init__()
+        # Initial transformation
+        x = torch.cat([torch.log(x+1e-8), torch.log10(x+1e-8)], dim=-1).float() #self.input_transform(x)
+        # x = torch.log10(x+1e-8).float()
+        return self.dec(self.enc(x))
+
+class PointNetCompressor(nn.Module):
+    def __init__(self, input_dim=3, latent_dim=4, attn_dim=64, num_heads=1, num_queries=64):
+        super(PointNetCompressor, self).__init__()
         self.input_dim = input_dim
-        self.element_nn = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            # nn.BLazyatchNorm1d(),
+        self.latent_dim = latent_dim
+        self.attn_dim = attn_dim
+        self.num_queries = num_queries  # Number of learnable query tokens
+
+        # Shared MLP for feature extraction
+        self.mlp1 = nn.Sequential(
+            nn.Conv1d(input_dim*2, 16, 1),
+            nn.BatchNorm1d(16),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            # nn.LazyBatchNorm1d(),
+            nn.Conv1d(16, 32, 1),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Conv1d(32, attn_dim, 1),
+            nn.BatchNorm1d(attn_dim),
             nn.ReLU()
         )
-        self.self_attention = SelfAttention(hidden_dim, num_heads)
-        self.aggregation_nn = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            # nn.LazyBatchNorm1d(),
+
+        # LayerNorm to stabilize self-attention
+        self.norm = nn.LayerNorm(attn_dim)
+
+        # Learnable query tokens for efficient self-attention
+        self.query_tokens = nn.Parameter(torch.randn(1, num_queries, attn_dim))
+
+        # Self-attention layer
+        self.attn = nn.MultiheadAttention(embed_dim=attn_dim, num_heads=num_heads, batch_first=True)
+
+        # Bottleneck layer for latent vector
+        self.mlp2 = nn.Sequential(
+            nn.Linear(attn_dim, 128),
+            nn.BatchNorm1d(128),
             nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim),
-            nn.Sigmoid()
+            nn.Linear(128, latent_dim)
         )
-        self.dropout = nn.Dropout(p=0.5)
+
+        # # Optional T-Net for input transformation
+        # self.tnet = nn.Sequential(
+        #     nn.Conv1d(input_dim*2, 32, 1),
+        #     nn.BatchNorm1d(32),
+        #     nn.ReLU(),
+        #     nn.Conv1d(32, 64, 1),
+        #     nn.BatchNorm1d(64),
+        #     nn.ReLU(),
+        #     nn.Conv1d(64, input_dim * input_dim, 1)
+        # )
 
     def forward(self, x):
-        input_dim = self.input_dim
-        # input_dim = 
-        batch_size, set_size, _ = x.size()
+        batch_size, num_points, dim = x.size()
+        x = torch.cat([torch.log(x+1e-8), torch.log10(x+1e-8)], dim=-1)
 
-        x = x.view(-1, input_dim)  # Shape: (batch_size * set_size, input_dim)
-        x = self.element_nn(x)  # Shape: (batch_size * set_size, hidden_dim)
-        x = x.view(batch_size, set_size, -1)  # Shape: (batch_size, set_size, hidden_dim)
+        # Reshape for 1D convolution: (batch, dim, num_points)
+        x = x.transpose(2, 1)
 
-        # x = self.self_attention(x)  # Shape: (batch_size, set_size, hidden_dim)
+        # # Input transformation (optional)
+        # transform = self.tnet(x)
+        # transform = torch.max(transform, dim=2, keepdim=False)[0]
+        # transform = transform.view(batch_size, dim, dim)
+        # x = torch.bmm(transform, x)  # (batch, dim, num_points)
 
-        x = x.sum(dim=1)  # Aggregation using sum (batch_size, hidden_dim)
+        # Feature extraction
+        x = self.mlp1(x)  # (batch, attn_dim, num_points)
 
-        # x = self.dropout(x)
-        x = self.aggregation_nn(x)  # Shape: (batch_size, output_dim)
+        # Reshape for attention: (batch, num_points, attn_dim)
+        x = x.transpose(1, 2)
 
-        return x
+        # Normalize before self-attention to prevent NaNs
+        x = self.norm(x)
 
+        # Downsample: select fixed number of query tokens
+        query_tokens = self.query_tokens.expand(batch_size, -1, -1)  # (batch, num_queries, attn_dim)
+        
+        # Self-attention with queries
+        attn_output, _ = self.attn(query_tokens, x, x)  # (batch, num_queries, attn_dim)
 
-class PointDiscriminator(nn.Module):
-    def __init__(self, loglog=False):
-        super(PointDiscriminator, self).__init__()
-        # Define your discriminator network architecture here
-        self.fc1 = nn.Linear(in_features=1, out_features=8)  # Assuming 3D points
-        self.fc2 = nn.Linear(in_features=8, out_features=1)  # Output a single scalar for each point
+        # Aggregate attention outputs across query tokens (mean pooling)
+        x = attn_output.mean(dim=1)  # (batch, attn_dim)
 
-        self.sigmoid = nn.Sigmoid()
-        self.loglog = False
-    def forward(self, point_cloud):
-        if self.loglog:
-            point_cloud = torch.log(point_cloud+1e-10)
-        # point_cloud shape: (batch_size, num_points, 3)
-        batch_size, num_points, _  = point_cloud.size()
+        # Latent vector
+        z = self.mlp2(x)  # (batch, latent_dim)
+        return z
 
-        # Flatten the point cloud to process each point individually
-        x = point_cloud.view(batch_size * num_points, -1)
-
-        x = torch.relu(self.fc1(x))
-        x = self.fc2(x)
-        x = self.sigmoid(x)
-
-        # Reshape back to (batch_size, num_points, 1)
-        x = x.view(batch_size, num_points, 1)
-
-        # Aggregate classification across points (mean or sum)
-        # Here, using mean to get a probability for the entire point cloud
-        point_cloud_decision = torch.mean(x, dim=1)  # shape: (batch_size, 1)
-
-        return point_cloud_decision
+class DiffusionModel(nn.Module):
+    def __init__(self, sample_dim, param_dim, hidden_dim=128, time_embedding_dim=32, sample_encode_dim=32, timesteps=1000, n_events=1000):
+        super(DiffusionModel, self).__init__()
+        self.timesteps = timesteps
+        
+        self.sample_encoder = PointNetCompressor(input_dim=sample_dim, latent_dim=sample_encode_dim)
+        
+        self.time_embedding = nn.Linear(1, time_embedding_dim)
+        
+        self.diffusion_process = nn.Sequential(
+            nn.Linear(sample_encode_dim + param_dim + time_embedding_dim, hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim, param_dim)
+        )
+    
+    def forward(self, samples, t, params):
+        t_embedding = self.time_embedding(t.squeeze().unsqueeze(-1).float())  # Simple sinusoidal encoding
+        samples_emb = self.sample_encoder(samples).squeeze()
+        combined_input = torch.cat([samples_emb, t_embedding, params], dim=-1)
+        pred_noise = self.diffusion_process(combined_input)
+        return pred_noise

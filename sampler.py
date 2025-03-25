@@ -27,6 +27,35 @@ torch.manual_seed(42)
 import torch
 import torch.distributions as dist
 
+class SimplifiedDIS:
+    def __init__(self, params):
+        self.Nu = 1
+        self.au = params[0].data
+        self.bu = params[1].data
+        self.Nd = 2
+        self.ad = params[2].data
+        self.bd = params[3].data
+    
+    def up(self, x):
+        u = self.Nu * (x ** self.au) * ((1 - x) ** self.bu)
+        return u
+    
+    def down(self, x):
+        d = self.Nd * (x ** self.ad) * ((1 - x) ** self.bd)
+        return d
+    
+    def sample(self, nevents):
+        xs_p = torch.rand(nevents)+1e-8
+        sigma_p = 4 * self.up(xs_p) + self.down(xs_p)
+        sigma_p = torch.nan_to_num(sigma_p, nan=0.0)  # Replace NaNs with 0
+        # print(sigma_p)
+        xs_n = torch.rand(nevents)+1e-8
+        sigma_n = 4 * self.down(xs_n) + self.up(xs_n)
+        sigma_n = torch.nan_to_num(sigma_n, nan=0.0)
+        # breakpoint()
+        return torch.cat([sigma_p.unsqueeze(0),sigma_n.unsqueeze(0)], dim = 0).t()
+
+
 class MultivariateMixtureModel:
     def __init__(self, means, covariances, weights):
         """
@@ -68,6 +97,9 @@ def generate_synthetic_data(
         if option == "poisson":
             dist = torch.distributions.poisson.Poisson(params)
             events = dist.sample((nevents,1)).to(device)
+        elif option == "SimplifiedDIS":
+            dist = SimplifiedDIS(params.cpu())
+            events = dist.sample(nevents).to(device)
         elif option == "mixture":
             p = 2
             n = 2

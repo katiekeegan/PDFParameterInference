@@ -1,0 +1,32 @@
+theory/
+results/
+# Ignore Python virtual environments
+venv/
+.env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore package manager files
+pip-log.txt
+pip-delete-this-directory.txt
+poetry.lock
+Pipfile.lock
+
+# Ignore IDE and editor files
+.vscode/
+.idea/
+*.swp
+
+# Ignore model and checkpoint files
+*.pth
+*.pt
+*.ckpt
+
+# Ignore images
+*.png
+*.jpg
+*.jpeg
+
+# Ignore Jupyter
