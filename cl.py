@@ -1,224 +1,137 @@
 import torch
+torch.cuda.empty_cache()
+
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-import numpy as np
-
-import torch
-import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+from models import PointNetEmbedding
+
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+torch.cuda.set_device(device)
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Use only GPU 0
 
 class SimplifiedDIS:
     def __init__(self, device=None):
-        self.Nu = 1
-        self.au = 1  # params[0]
-        self.bu = 1  # params[1]
-        self.Nd = 2
-        self.ad = 1  # params[2]
-        self.bd = 1  # params[3]
-        self.device = device
+        self.device = device or torch.device("cpu")
 
-    def __call__(self, depth_profiles: np.ndarray):
-        """Call to simulator."""
+    def __call__(self, depth_profiles: torch.Tensor):
         return self.sample(depth_profiles)
 
     def init(self, params):
-        self.Nu = 1
-        self.au = params[0]
-        self.bu = params[1]
-        self.Nd = 2
-        self.ad = params[2]
-        self.bd = params[3]
+        self.au, self.bu, self.ad, self.bd = params.to(self.device)
 
     def up(self, x):
-        u = self.Nu * (x ** self.au) * ((1 - x) ** self.bu)
-        return u
+        return (x ** self.au) * ((1 - x) ** self.bu)
 
     def down(self, x):
-        d = self.Nd * (x ** self.ad) * ((1 - x) ** self.bd)
-        return d
+        return (x ** self.ad) * ((1 - x) ** self.bd)
 
     def sample(self, params, nevents=1):
-        self.init(torch.tensor(params, device=self.device))
-
+        self.init(params)
         xs_p = torch.rand(nevents, device=self.device)
         sigma_p = 4 * self.up(xs_p) + self.down(xs_p)
-        sigma_p = torch.nan_to_num(sigma_p, nan=0.0)  # Replace NaNs with 0
+        sigma_p = torch.nan_to_num(sigma_p, nan=0.0)
 
         xs_n = torch.rand(nevents, device=self.device)
         sigma_n = 4 * self.down(xs_n) + self.up(xs_n)
         sigma_n = torch.nan_to_num(sigma_n, nan=0.0)
 
-        return torch.cat([sigma_p.unsqueeze(0), sigma_n.unsqueeze(0)], dim=0).t()
+        return torch.stack([sigma_p, sigma_n], dim=-1)
 
 
-def generate_data(num_samples, num_events, theta_dim=4, x_dim=2, device=torch.device("cpu")):
-    """
-    Generate a dataset of (theta, x) pairs using the simulator.
-    theta: (num_samples, theta_dim)
-    x: (num_samples, num_events, x_dim)
-    """
+def generate_data(num_samples, num_events, theta_dim=4, device=device):
     simulator = SimplifiedDIS(device)
+
+    thetas = torch.rand((num_samples, theta_dim), dtype=torch.float32, device=device) * 10
+    xs = torch.stack([simulator.sample(theta, num_events) for theta in thetas]).to(device)
+
+    return thetas, xs
+
+
+def advanced_feature_engineering(xs_tensor):
+    log_features = torch.log1p(xs_tensor)
+    symlog_features = torch.sign(xs_tensor) * torch.log1p(xs_tensor.abs())
+
+    ratio_features = []
+    diff_features = []
+    for i in range(xs_tensor.shape[-1]):
+        for j in range(i + 1, xs_tensor.shape[-1]):
+            ratio = xs_tensor[..., i] / (xs_tensor[..., j] + 1e-8)
+            ratio_features.append(torch.log1p(ratio.abs()).unsqueeze(-1))
+
+            diff = torch.log1p(xs_tensor[..., i]) - torch.log1p(xs_tensor[..., j])
+            diff_features.append(diff.unsqueeze(-1))
+
+    ratio_features = torch.cat(ratio_features, dim=-1)
+    diff_features = torch.cat(diff_features, dim=-1)
+
+    return torch.cat([log_features, symlog_features, ratio_features, diff_features], dim=-1)
+
+
+def train(model, thetas, xs, num_epochs=10, batch_size=32, lr=1e-3, num_workers=0):  # Set num_workers=0
+    device = thetas.device
+    xs_tensor = advanced_feature_engineering(xs)
     
-    # Define the parameter ranges for the thetas
-    ranges = [(-10, 10), (-10,10), (-10,10), (-10,10)]  # Example ranges
+    # Move to CPU for DataLoader if using num_workers > 0
+    thetas_cpu = thetas.cpu()
+    xs_tensor_cpu = xs_tensor.cpu()
     
-    # Generate thetas within the defined ranges
-    thetas = np.column_stack([np.random.uniform(low, high, size=num_samples) for low, high in ranges])
-    
-    # Generate xs based on the thetas using the simulator
-    xs = np.array([simulator.sample(theta, num_events).cpu().numpy() for theta in thetas]) + 1e-8
-    
-    # Convert the generated numpy arrays to PyTorch tensors
-    thetas_tensor = torch.tensor(thetas, dtype=torch.float32, device=device)
-    xs_tensor = torch.tensor(xs, dtype=torch.float32, device=device)
-    
-    return thetas_tensor, xs_tensor
+    dataset = TensorDataset(thetas_cpu, xs_tensor_cpu)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, 
+                          num_workers=num_workers, pin_memory=True)
 
-class PointNetEmbedding(nn.Module):
-    def __init__(self, input_dim=2, latent_dim=64, outlier_attention_factor=10.0):
-        super(PointNetEmbedding, self).__init__()
-        self.input_dim = input_dim
-        self.latent_dim = latent_dim
-        self.outlier_attention_factor = outlier_attention_factor
-        
-        # MLP layers for point feature transformation
-        self.mlp1 = nn.Sequential(
-            nn.Linear(self.input_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 128),
-            nn.ReLU(),
-            nn.Linear(128, 256),
-            nn.ReLU()
-        )
-
-        # Final layers to get latent representation
-        self.mlp2 = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, self.latent_dim)
-        )
-
-    def forward(self, x):
-        """
-        Forward pass for embedding the input events into a latent vector.
-        x: Tensor of shape (batch_size, num_events, input_dim)
-        """
-        # Ensure the input shape is as expected
-        batch_size, num_events, _ = x.shape  # Get the batch size and number of events
-
-        # Transform each point using the MLP
-        x = self.mlp1(x)  # Shape will be (batch_size, num_events, 256)
-        # Apply Max pooling for permutation invariance
-        x = x.permute(0, 2, 1)  # Change shape to (batch_size, 256, num_events)
-        # Take the max across the num_events dimension (dimension 1)
-        x, _ = torch.max(x, dim=-1)  # Shape becomes (batch_size, 256)
-        x = x.squeeze(-1)  # Shape becomes (batch_size, 256)
-        # Apply final MLP to get latent vector
-        latent = self.mlp2(x)  # Shape becomes (batch_size, latent_dim)
-        
-        # Attention for outliers (use a simple attention mechanism for now)
-        attention = torch.sigmoid(latent) * self.outlier_attention_factor
-        latent = latent * attention  # Apply attention to give more weight to outliers
-        
-        return latent  # Shape will be (batch_size, latent_dim)
-
-def generate_labels(thetas, max_distance=20.0):
-    """
-    Generate continuous similarity labels for each pair based on the scaled Euclidean distance 
-    between theta values. Return a continuous similarity score in the range [0, 1].
-    """
-    labels = []
-    for i in range(len(thetas)):
-        for j in range(i + 1, len(thetas)):
-            similarity = torch.norm(thetas[i] - thetas[j]) # Compute distance between thetas
-            # similarity = 1.0 - dist/max_distance  # Scale the distance
-            labels.append(similarity)
-    labels = torch.tensor(labels, dtype=torch.float32)
-    labels = labels/labels.max()
-    return labels
-
-def contrastive_loss(latent1, latent2, similarity):
-    """
-    Contrastive loss function with continuous similarity labels, no margin.
-    """
-    euclidean_distance = torch.norm(latent1 - latent2, p=2)
-    loss = 0.5 * (similarity * torch.pow(euclidean_distance, 2) + 
-                  (1 - similarity) * torch.pow(euclidean_distance, 2))
-    return loss.mean()
-
-
-# Example training loop
-def train(model, thetas, xs, num_epochs=10, batch_size=32, learning_rate=1e-3, margin=1.0):
-    """
-    Train the PointNet model with contrastive loss.
-    """
-    # Prepare dataset: Convert thetas and xs into PyTorch tensors
-    thetas_tensor = torch.tensor(thetas, dtype=torch.float32)
-    xs_tensor = torch.tensor(xs, dtype=torch.float32)
-    
-    # Create DataLoader
-    dataset = TensorDataset(thetas_tensor, xs_tensor)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    
-    # Set up optimizer
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    scaler = torch.cuda.amp.GradScaler()
+    loss_history = []
 
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0
 
-        for i, (theta, x) in enumerate(dataloader):
+        for theta_batch, x_batch in dataloader:
+            theta_batch, x_batch = theta_batch.to(device), x_batch.to(device)
             optimizer.zero_grad()
-            
-            # Get latent vectors for each sample in the batch
-            latent_vectors = model(x)  # Latent vectors for batch
-            
-            # Generate labels based on thetas' similarity
-            labels = generate_labels(thetas)  # Adjust threshold as needed
-                        
-            # Create pairs of latent vectors and corresponding labels
-            batch_size = latent_vectors.size(0)
-            loss = 0
-            pair_idx = 0
-            
-            for j in range(batch_size):
-                for k in range(j + 1, batch_size):  # Generate pairs
-                    latent1 = latent_vectors[j]
-                    latent2 = latent_vectors[k]
-                    label = labels[pair_idx]
-                    pair_idx += 1
 
-                    # Compute contrastive loss for the pair
-                    loss += contrastive_loss(latent1, latent2, label)
-            
-            # Backpropagate and update the model
-            loss.backward()
-            optimizer.step()
-            
+            with torch.cuda.amp.autocast():
+                embeddings = model(x_batch)
+                # Calculate distances within the current batch only
+                dists = torch.cdist(embeddings, embeddings, p=2)
+                
+                # Calculate target distances for the corresponding thetas in this batch
+                target_dists = torch.cdist(theta_batch, theta_batch, p=2)
+                
+                loss = F.mse_loss(dists, target_dists)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
             total_loss += loss.item()
 
-        print(f'Epoch {epoch + 1}/{num_epochs}, Loss: {total_loss/len(dataloader)}')
+        avg_loss = total_loss / len(dataloader)
+        loss_history.append(avg_loss)
+        print(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}')
+
+    return model, loss_history
 
 
-# Example usage:
-# Simulate some data for `xs`
-num_samples = 300
-num_events = 10000
-thetas, xs = generate_data(num_samples, num_events)
-multi_log=True
-log=False
+# Run training
+num_samples = 200
+num_events = 100000
+thetas, xs = generate_data(num_samples, num_events, device=device)
 
-# Convert `xs` to torch tensor
-xs_tensor = torch.tensor(xs, dtype=torch.float32)
-if multi_log:
-    xs_tensor = torch.cat([torch.log(xs_tensor + 1e-8), torch.log10(xs_tensor + 1e-8)], dim=-1).float()
-elif log:
-    xs_tensor = torch.log(xs_tensor + 1e-8)
-# Initialize the model
-model = PointNetEmbedding(input_dim=xs_tensor.shape[-1], latent_dim=64)
+xs_tensor_engineered = advanced_feature_engineering(xs)
+input_dim = xs_tensor_engineered.shape[-1]
 
-# Train the model
-train(model, thetas, xs_tensor, num_epochs=100, batch_size=32, learning_rate=1e-3, margin=1.0)
-# Saving the model
+model = PointNetEmbedding(input_dim=input_dim, latent_dim=128).to(device)
+if torch.cuda.device_count() > 1:
+    model = nn.DataParallel(model)
+
+model, loss_history = train(model, thetas, xs, num_epochs=200, batch_size=32, lr=1e-3)
+
 torch.save(model.state_dict(), 'pointnet_embedding.pth')
+np.save('loss_history.npy', np.array(loss_history))
