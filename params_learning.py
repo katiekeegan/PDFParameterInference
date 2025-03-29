@@ -3,6 +3,32 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 from torch.utils.data import DataLoader, TensorDataset, Dataset
+from models import *
+
+def nll_loss(predicted_mean, predicted_var, true_params):
+    """Negative log-likelihood loss."""
+    loss = 0.5 * torch.mean(torch.log(predicted_var+1e-8) + (true_params - predicted_mean)**2 / predicted_var)
+    return loss
+
+def advanced_feature_engineering(xs_tensor):
+    log_features = torch.log1p(xs_tensor)
+    symlog_features = torch.sign(xs_tensor) * torch.log1p(xs_tensor.abs())
+
+    ratio_features = []
+    diff_features = []
+    for i in range(xs_tensor.shape[-1]):
+        for j in range(i + 1, xs_tensor.shape[-1]):
+            ratio = xs_tensor[..., i] / (xs_tensor[..., j] + 1e-8)
+            ratio_features.append(torch.log1p(ratio.abs()).unsqueeze(-1))
+
+            diff = torch.log1p(xs_tensor[..., i]) - torch.log1p(xs_tensor[..., j])
+            diff_features.append(diff.unsqueeze(-1))
+
+    ratio_features = torch.cat(ratio_features, dim=-1)
+    diff_features = torch.cat(diff_features, dim=-1)
+
+    return torch.cat([log_features, symlog_features, ratio_features, diff_features], dim=-1)
+
 
 class SimplifiedDIS:
     def __init__(self, device=None):
@@ -57,7 +83,7 @@ def generate_data(num_samples, num_events, theta_dim=4, x_dim=2, device=torch.de
     simulator = SimplifiedDIS(device)
     
     # Define the parameter ranges for the thetas
-    ranges = [(-10, 10), (-10,10), (-10,10), (-10,10)]  # Example ranges
+    ranges = [(0, 10), (0,10), (0,10), (0,10)]  # Example ranges
     
     # Generate thetas within the defined ranges
     thetas = np.column_stack([np.random.uniform(low, high, size=num_samples) for low, high in ranges])
@@ -70,69 +96,7 @@ def generate_data(num_samples, num_events, theta_dim=4, x_dim=2, device=torch.de
     xs_tensor = torch.tensor(xs, dtype=torch.float32, device=device)
     
     return thetas_tensor, xs_tensor
-class PointNetEmbedding(nn.Module):
-    def __init__(self, input_dim=2, latent_dim=64, outlier_attention_factor=10.0):
-        super(PointNetEmbedding, self).__init__()
-        self.input_dim = input_dim
-        self.latent_dim = latent_dim
-        self.outlier_attention_factor = outlier_attention_factor
-        
-        # MLP layers for point feature transformation
-        self.mlp1 = nn.Sequential(
-            nn.Linear(self.input_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 128),
-            nn.ReLU(),
-            nn.Linear(128, 256),
-            nn.ReLU()
-        )
 
-        # Final layers to get latent representation
-        self.mlp2 = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, self.latent_dim)
-        )
-
-    def forward(self, x):
-        """
-        Forward pass for embedding the input events into a latent vector.
-        x: Tensor of shape (batch_size, num_events, input_dim)
-        """
-        # Ensure the input shape is as expected
-        batch_size, num_events, _ = x.shape  # Get the batch size and number of events
-
-        # Transform each point using the MLP
-        x = self.mlp1(x)  # Shape will be (batch_size, num_events, 256)
-        # Apply Max pooling for permutation invariance
-        x = x.permute(0, 2, 1)  # Change shape to (batch_size, 256, num_events)
-        # Take the max across the num_events dimension (dimension 1)
-        x, _ = torch.max(x, dim=-1)  # Shape becomes (batch_size, 256)
-        x = x.squeeze(-1)  # Shape becomes (batch_size, 256)
-        # Apply final MLP to get latent vector
-        latent = self.mlp2(x)  # Shape becomes (batch_size, latent_dim)
-        
-        # Attention for outliers (use a simple attention mechanism for now)
-        attention = torch.sigmoid(latent) * self.outlier_attention_factor
-        latent = latent * attention  # Apply attention to give more weight to outliers
-        
-        return latent  # Shape will be (batch_size, latent_dim)
-
-
-class LatentToParamsNN(nn.Module):
-    def __init__(self, latent_dim, param_dim):
-        super(LatentToParamsNN, self).__init__()
-        # Define layers
-        self.fc1 = nn.Linear(latent_dim, 128)  # First fully connected layer
-        self.fc2 = nn.Linear(128, 64)          # Second fully connected layer
-        self.fc3 = nn.Linear(64, param_dim)    # Output layer
-
-    def forward(self, x):
-        # Forward pass through the network
-        x = torch.relu(self.fc1(x))  # Apply ReLU activation after first layer
-        x = torch.relu(self.fc2(x))  # Apply ReLU activation after second layer
-        x = 10*torch.tanh(self.fc3(x))              # Output layer (no activation, linear output)
-        return x
 
 class EventDataset(Dataset):
     def __init__(self, event_data, param_data, pointnet_model, device):
@@ -152,9 +116,64 @@ class EventDataset(Dataset):
         latent_embedding = self.pointnet_model(events.unsqueeze(0).to(self.device))  # Ensure it is on the correct device
         return latent_embedding, params
 
+class MDN(nn.Module):
+    def __init__(self, latent_dim, param_dim, num_components=3):
+        """
+        latent_dim: Dimension of the latent representation.
+        param_dim: Number of parameters to predict.
+        num_components: Number of mixture components.
+        """
+        super(MDN, self).__init__()
+        self.param_dim = param_dim
+        self.num_components = num_components
+        
+        self.fc1 = nn.Linear(latent_dim, 128)
+        self.fc2 = nn.Linear(128, 64)
+        
+        # Each output now predicts (param_dim * num_components) values.
+        self.pi = nn.Linear(64, param_dim * num_components)
+        self.mu = nn.Linear(64, param_dim * num_components)
+        self.log_var = nn.Linear(64, param_dim * num_components)
 
-# Training Function
-def train(model, pointnet_model, dataloader, criterion, optimizer, device):
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        batch_size = x.size(0)
+        
+        # Reshape to (batch_size, param_dim, num_components)
+        pi = self.pi(x).view(batch_size, self.param_dim, self.num_components)
+        pi = F.softmax(pi, dim=-1)
+        
+        mu = 10 * torch.sigmoid(self.mu(x).view(batch_size, self.param_dim, self.num_components))
+        log_var = self.log_var(x).view(batch_size, self.param_dim, self.num_components)
+        sigma = torch.exp(log_var)
+        return pi, mu, sigma
+
+def mdn_loss(pi, mu, sigma, target):
+    """
+    Computes the negative log-likelihood loss for an MDN.
+    - pi: Mixture weights of shape (batch_size, param_dim, num_components)
+    - mu: Means of shape (batch_size, param_dim, num_components)
+    - sigma: Standard deviations of shape (batch_size, param_dim, num_components)
+    - target: True parameters of shape (batch_size, param_dim)
+    """
+    # Expand target to have a new dimension for the components
+    target = target.unsqueeze(2).expand_as(mu)  # Now shape: (batch_size, param_dim, num_components)
+    
+    # Compute log probability for each Gaussian component
+    normal = torch.distributions.Normal(mu, sigma)
+    log_prob = normal.log_prob(target)  # (batch_size, param_dim, num_components)
+    
+    # Weight by the mixture weights and sum using LogSumExp for stability
+    weighted_log_prob = torch.log(pi + 1e-8) + log_prob  # Avoid log(0)
+    log_sum = torch.logsumexp(weighted_log_prob, dim=2)  # Sum over mixture components
+    
+    loss = -torch.mean(log_sum)  # Negative log-likelihood loss
+    return loss
+
+
+
+def train(model, pointnet_model, dataloader, optimizer, device):
     model.train()
     total_loss = 0
 
@@ -162,48 +181,48 @@ def train(model, pointnet_model, dataloader, criterion, optimizer, device):
         latent_embeddings = latent_embeddings.to(device)
         true_params = true_params.to(device)
 
-        # Zero gradients
         optimizer.zero_grad()
 
-        # Forward pass through LatentToParamsNN
-        predicted_params = model(latent_embeddings)
+        # pred_mean, pred_log_var = model(latent_embeddings)
+        # loss = nll_loss(pred_mean, pred_log_var, true_params)
+        pi, mu, sigma = model(latent_embeddings)  # MDN outputs
+        loss = mdn_loss(pi, mu, sigma, true_params.squeeze())  # Adjust true_params shape if needed
 
-        # Compute loss
-        loss = criterion(predicted_params.squeeze(), true_params.squeeze())
         total_loss += loss.item()
-
-        # Backward pass and optimization
         loss.backward()
         optimizer.step()
 
-    avg_loss = total_loss / len(dataloader)
-    return avg_loss
+    return total_loss / len(dataloader)
+
 
 def main():
     # Assuming latent_dim and param_dim are defined
-    latent_dim = 64  # Example latent dimension
+    latent_dim = 128  # Example latent dimension
 
     # Instantiate the model
-    model = LatentToParamsNN(latent_dim, 4)
+    # model = LatentToParamsNN(latent_dim, 4)
+    model = MDN(latent_dim, 4)
     # Example usage:
     # Simulate some data for `xs`
-    num_samples = 300
-    num_events = 10000
+    num_samples = 1000
+    num_events = 100000
     thetas, xs = generate_data(num_samples, num_events)
-    multi_log=True
-    log=False
-    # Convert `xs` to torch tensor
-    xs_tensor = torch.tensor(xs, dtype=torch.float32)
-    if multi_log:
-        xs_tensor = torch.cat([torch.log(xs_tensor + 1e-8), torch.log10(xs_tensor + 1e-8)], dim=-1).float()
-    elif log:
-        xs_tensor = torch.log(xs_tensor + 1e-8)
+    # multi_log=True
+    # log=False
+    # # Convert `xs` to torch tensor
+    # xs_tensor = torch.tensor(xs, dtype=torch.float32)
+    # if multi_log:
+    #     xs_tensor = torch.cat([torch.log(xs_tensor + 1e-8), torch.log10(xs_tensor + 1e-8)], dim=-1).float()
+    # elif log:
+    #     xs_tensor = torch.log(xs_tensor + 1e-8)
+    xs_tensor_engineered = advanced_feature_engineering(xs)
+    input_dim = xs_tensor_engineered.shape[-1]
     # Example input: latent embeddings of shape (batch_size, latent_dim)
     # Create the model again
-    pointnet_model = PointNetEmbedding(input_dim=xs_tensor.shape[-1], latent_dim=64)
+    pointnet_model = PointNetEmbedding(input_dim=input_dim, latent_dim=128)
 
     # Load the saved state_dict into the model
-    pointnet_model.load_state_dict(torch.load('pointnet_embedding.pth'))
+    pointnet_model.load_state_dict(torch.load('pointnet_embedding_1000.pth'))
     pointnet_model.eval()  
 
     # Define the loss function and optimizer
@@ -216,11 +235,12 @@ def main():
     pointnet_model.to(device)
 
     # Create Dataset and DataLoader
+    xs_tensor = advanced_feature_engineering(xs)
     dataset = EventDataset(xs_tensor, thetas, pointnet_model, device)
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-    num_epochs = 10000  # Set the number of epochs
+    num_epochs = 300  # Set the number of epochs
     for epoch in range(num_epochs):
-        avg_loss = train(model, pointnet_model, dataloader, criterion, optimizer, device)
+        avg_loss = train(model, pointnet_model, dataloader, optimizer, device)
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
 
     # Save the trained model
@@ -229,43 +249,49 @@ def main():
 
 import matplotlib.pyplot as plt
 
-def evaluate_and_plot(model, pointnet_model, dataloader, device):
-    model.eval()  # Set the model to evaluation mode
-    predicted_params_list = []
-    true_params_list = []
+def predict_with_uncertainty(model, latent_embedding):
+    model.eval()
+    with torch.no_grad():
+        mean, log_var = model(latent_embedding)
+        std = torch.exp(0.5 * log_var)  # Convert log variance to standard deviation
+        sampled_theta = mean + std * torch.randn_like(std)  # Sample from predicted distribution
+    return sampled_theta, mean, std
 
-    # Iterate over the dataset
-    with torch.no_grad():  # No need to compute gradients for evaluation
+
+def evaluate_and_plot(model, pointnet_model, dataloader, device):
+    model.eval()
+    true_params_list = []
+    predicted_means = []
+    predicted_stds = []
+
+    with torch.no_grad():
         for latent_embeddings, true_params in dataloader:
             latent_embeddings = latent_embeddings.to(device)
             true_params = true_params.to(device)
 
-            # Forward pass through LatentToParamsNN
-            predicted_params = model(latent_embeddings)
+            pred_mean, pred_log_var = model(latent_embeddings)
+            pred_std = torch.exp(0.5 * pred_log_var)
 
-            # Store the true and predicted parameters
-            predicted_params_list.append(predicted_params)
-            true_params_list.append(true_params)
+            true_params_list.append(true_params.cpu().numpy())
+            predicted_means.append(pred_mean.cpu().numpy())
+            predicted_stds.append(pred_std.cpu().numpy())
 
-    # Convert lists to tensors
-    predicted_params = torch.cat(predicted_params_list, dim=0)
-    true_params = torch.cat(true_params_list, dim=0)
+    true_params_array = np.concatenate(true_params_list)
+    pred_means_array = np.concatenate(predicted_means)
+    pred_stds_array = np.concatenate(predicted_stds)
 
-    # Compute the errors
-    errors = predicted_params - true_params  # Shape: (num_samples, param_dim)
-
-    # Plotting the error distribution for each parameter
-    fig, axes = plt.subplots(1, 4, figsize=(20, 5))  # 4 subplots for the 4 parameters
-    for i in range(4):
-        ax = axes[i]
-        ax.hist(errors[:, i].cpu().numpy(), bins=50, alpha=0.7)
-        ax.set_title(f'Error Distribution for Parameter {i+1}')
-        ax.set_xlabel('Error')
-        ax.set_ylabel('Frequency')
-
-    plt.tight_layout()
-    plt.show()
-    plt.savefig('Error_Distribution.png')
+    # Plot the predicted mean with confidence intervals
+    plt.figure(figsize=(10, 6))
+    for i in range(true_params_array.shape[1]):  # Loop over each parameter
+        plt.errorbar(
+            range(len(true_params_array)), pred_means_array[:, i],
+            yerr=2 * pred_stds_array[:, i], fmt='o', label=f'Parameter {i}'
+        )
+    plt.legend()
+    plt.xlabel('Sample index')
+    plt.ylabel('Predicted parameter values')
+    plt.title('Predicted parameters with uncertainty')
+    plt.savefig('Uncertainty.png')
 if __name__ == "__main__":
     main()
     # After training, call the evaluate_and_plot function
