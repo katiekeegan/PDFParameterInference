@@ -72,7 +72,36 @@ def advanced_feature_engineering(xs_tensor):
     return torch.cat([log_features, symlog_features, ratio_features, diff_features], dim=-1)
 
 
-def train(model, thetas, xs, num_epochs=10, batch_size=32, lr=1e-3, num_workers=0):  # Set num_workers=0
+class ContrastiveLoss(nn.Module):
+    def __init__(self, margin=0.5, scale=2.0):  # Reduced margin
+        super().__init__()
+        self.margin = margin
+        self.scale = scale  # Helps prevent collapse
+        
+    def forward(self, embeddings, thetas):
+        # Normalize embeddings first
+        embeddings = F.normalize(embeddings, p=2, dim=-1)
+        
+        # Calculate cosine similarity (-1 to 1) instead of distance
+        sim_matrix = torch.mm(embeddings, embeddings.t())  # [batch, batch]
+        
+        # Convert to angular distance (0 to 2)
+        emb_dists = 1.0 - sim_matrix  # Now in [0,2]
+        
+        theta_dists = torch.cdist(thetas, thetas)
+        theta_dists = theta_dists / (theta_dists.max() + 1e-8)
+        
+        # Dynamic similarity thresholds
+        sim_mask = (theta_dists < 0.15).float()
+        dissim_mask = (theta_dists > 0.35).float()
+        
+        # Scaled loss components
+        loss_sim = (sim_mask * emb_dists).mean()
+        loss_dissim = (dissim_mask * F.relu(self.margin - emb_dists)).mean()
+        
+        return (loss_sim + self.scale * loss_dissim) / (1 + self.scale)
+
+def train(model, thetas, xs, num_epochs=10, batch_size=32, lr=1e-3, num_workers=0):
     device = thetas.device
     xs_tensor = advanced_feature_engineering(xs)
     
@@ -84,8 +113,9 @@ def train(model, thetas, xs, num_epochs=10, batch_size=32, lr=1e-3, num_workers=
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, 
                           num_workers=num_workers, pin_memory=True)
 
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)  # Added weight decay
     scaler = torch.cuda.amp.GradScaler()
+    loss_fn = ContrastiveLoss(margin=1.0)
     loss_history = []
 
     for epoch in range(num_epochs):
@@ -98,13 +128,8 @@ def train(model, thetas, xs, num_epochs=10, batch_size=32, lr=1e-3, num_workers=
 
             with torch.cuda.amp.autocast():
                 embeddings = model(x_batch)
-                # Calculate distances within the current batch only
-                dists = torch.cdist(embeddings, embeddings, p=2)
-                
-                # Calculate target distances for the corresponding thetas in this batch
-                target_dists = torch.cdist(theta_batch, theta_batch, p=2)
-                
-                loss = F.mse_loss(dists, target_dists)
+                l2_reg = 0.001 * torch.mean(torch.norm(embeddings, p=2, dim=1))
+                loss = loss_fn(embeddings, theta_batch) + l2_reg
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -118,10 +143,9 @@ def train(model, thetas, xs, num_epochs=10, batch_size=32, lr=1e-3, num_workers=
 
     return model, loss_history
 
-
 # Run training
 num_samples = 200
-num_events = 100000
+num_events = 1000000
 thetas, xs = generate_data(num_samples, num_events, device=device)
 
 xs_tensor_engineered = advanced_feature_engineering(xs)
@@ -131,7 +155,8 @@ model = PointNetEmbedding(input_dim=input_dim, latent_dim=128).to(device)
 if torch.cuda.device_count() > 1:
     model = nn.DataParallel(model)
 
-model, loss_history = train(model, thetas, xs, num_epochs=200, batch_size=32, lr=1e-3)
+model, loss_history = train(model, thetas, xs, num_epochs=100, batch_size=16, lr=1e-3)
 
-torch.save(model.state_dict(), 'pointnet_embedding.pth')
+torch.save(model.state_dict(), 'pointnet_embedding_1000000.pth')
 np.save('loss_history.npy', np.array(loss_history))
+
