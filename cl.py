@@ -1,19 +1,32 @@
+import os
 import torch
-torch.cuda.empty_cache()
-
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
 import torch.nn.functional as F
 import numpy as np
+from torch.utils.data import DataLoader, TensorDataset
 from models import PointNetEmbedding
+import argparse
 
+# Set up argument parsing
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train a model with simplified DIS simulation.")
+    parser.add_argument('--num_samples', type=int, default=200, help="Number of samples to generate")
+    parser.add_argument('--num_events', type=int, default=1000000, help="Number of events to simulate")
+    parser.add_argument('--num_epochs', type=int, default=100, help="Number of epochs for training")
+    parser.add_argument('--batch_size', type=int, default=16, help="Batch size for training")
+    parser.add_argument('--lr', type=float, default=1e-3, help="Learning rate")
+    parser.add_argument('--device', type=str, default="cuda:0", help="Device to use for training")
+    return parser.parse_args()
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-torch.cuda.set_device(device)
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Use only GPU 0
+# Device setup
+def setup_device(device_str):
+    device = torch.device(device_str if torch.cuda.is_available() else "cpu")
+    torch.cuda.set_device(device)
+    os.environ["CUDA_VISIBLE_DEVICES"] = device_str.split(":")[1] if device_str.startswith("cuda") else ""
+    return device
 
+# Define the SimplifiedDIS class
 class SimplifiedDIS:
     def __init__(self, device=None):
         self.device = device or torch.device("cpu")
@@ -42,16 +55,14 @@ class SimplifiedDIS:
 
         return torch.stack([sigma_p, sigma_n], dim=-1)
 
-
-def generate_data(num_samples, num_events, theta_dim=4, device=device):
+# Data generation function
+def generate_data(num_samples, num_events, theta_dim=4, device=torch.device("cpu")):
     simulator = SimplifiedDIS(device)
-
     thetas = torch.rand((num_samples, theta_dim), dtype=torch.float32, device=device) * 10
     xs = torch.stack([simulator.sample(theta, num_events) for theta in thetas]).to(device)
-
     return thetas, xs
 
-
+# Feature engineering function
 def advanced_feature_engineering(xs_tensor):
     log_features = torch.log1p(xs_tensor)
     symlog_features = torch.sign(xs_tensor) * torch.log1p(xs_tensor.abs())
@@ -71,49 +82,40 @@ def advanced_feature_engineering(xs_tensor):
 
     return torch.cat([log_features, symlog_features, ratio_features, diff_features], dim=-1)
 
-
+# Contrastive loss definition
 class ContrastiveLoss(nn.Module):
-    def __init__(self, margin=0.5, scale=2.0):  # Reduced margin
+    def __init__(self, margin=0.5, scale=2.0):
         super().__init__()
         self.margin = margin
-        self.scale = scale  # Helps prevent collapse
-        
+        self.scale = scale
+
     def forward(self, embeddings, thetas):
-        # Normalize embeddings first
         embeddings = F.normalize(embeddings, p=2, dim=-1)
-        
-        # Calculate cosine similarity (-1 to 1) instead of distance
-        sim_matrix = torch.mm(embeddings, embeddings.t())  # [batch, batch]
-        
-        # Convert to angular distance (0 to 2)
-        emb_dists = 1.0 - sim_matrix  # Now in [0,2]
-        
+        sim_matrix = torch.mm(embeddings, embeddings.t())
+        emb_dists = 1.0 - sim_matrix
         theta_dists = torch.cdist(thetas, thetas)
         theta_dists = theta_dists / (theta_dists.max() + 1e-8)
-        
-        # Dynamic similarity thresholds
+
         sim_mask = (theta_dists < 0.15).float()
         dissim_mask = (theta_dists > 0.35).float()
-        
-        # Scaled loss components
+
         loss_sim = (sim_mask * emb_dists).mean()
         loss_dissim = (dissim_mask * F.relu(self.margin - emb_dists)).mean()
-        
+
         return (loss_sim + self.scale * loss_dissim) / (1 + self.scale)
 
+# Training function
 def train(model, thetas, xs, num_epochs=10, batch_size=32, lr=1e-3, num_workers=0):
     device = thetas.device
     xs_tensor = advanced_feature_engineering(xs)
-    
-    # Move to CPU for DataLoader if using num_workers > 0
+
     thetas_cpu = thetas.cpu()
     xs_tensor_cpu = xs_tensor.cpu()
-    
-    dataset = TensorDataset(thetas_cpu, xs_tensor_cpu)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, 
-                          num_workers=num_workers, pin_memory=True)
 
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)  # Added weight decay
+    dataset = TensorDataset(thetas_cpu, xs_tensor_cpu)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     scaler = torch.cuda.amp.GradScaler()
     loss_fn = ContrastiveLoss(margin=1.0)
     loss_history = []
@@ -143,20 +145,29 @@ def train(model, thetas, xs, num_epochs=10, batch_size=32, lr=1e-3, num_workers=
 
     return model, loss_history
 
-# Run training
-num_samples = 200
-num_events = 1000000
-thetas, xs = generate_data(num_samples, num_events, device=device)
+# Main function to run the training
+def main():
+    args = parse_args()
+    device = setup_device(args.device)
 
-xs_tensor_engineered = advanced_feature_engineering(xs)
-input_dim = xs_tensor_engineered.shape[-1]
+    # Generate data
+    thetas, xs = generate_data(args.num_samples, args.num_events, device=device)
+    
+    # Feature engineering
+    xs_tensor_engineered = advanced_feature_engineering(xs)
+    input_dim = xs_tensor_engineered.shape[-1]
 
-model = PointNetEmbedding(input_dim=input_dim, latent_dim=128).to(device)
-if torch.cuda.device_count() > 1:
-    model = nn.DataParallel(model)
+    # Initialize model
+    model = PointNetEmbedding(input_dim=input_dim, latent_dim=128).to(device)
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
 
-model, loss_history = train(model, thetas, xs, num_epochs=100, batch_size=16, lr=1e-3)
+    # Train the model
+    model, loss_history = train(model, thetas, xs, num_epochs=args.num_epochs, batch_size=args.batch_size, lr=args.lr)
 
-torch.save(model.state_dict(), 'pointnet_embedding_1000000.pth')
-np.save('loss_history.npy', np.array(loss_history))
+    # Save model and loss history
+    torch.save(model.state_dict(), 'pointnet_embedding.pth')
+    np.save('loss_history.npy', np.array(loss_history))
 
+if __name__ == "__main__":
+    main()
