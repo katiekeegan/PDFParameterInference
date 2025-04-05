@@ -11,9 +11,9 @@ import argparse
 # Set up argument parsing
 def parse_args():
     parser = argparse.ArgumentParser(description="Train a model with simplified DIS simulation.")
-    parser.add_argument('--num_samples', type=int, default=200, help="Number of samples to generate")
-    parser.add_argument('--num_events', type=int, default=1000000, help="Number of events to simulate")
-    parser.add_argument('--num_epochs', type=int, default=100, help="Number of epochs for training")
+    parser.add_argument('--num_samples', type=int, default=300, help="Number of samples to generate")
+    parser.add_argument('--num_events', type=int, default=500000, help="Number of events to simulate")
+    parser.add_argument('--num_epochs', type=int, default=1000, help="Number of epochs for training")
     parser.add_argument('--batch_size', type=int, default=16, help="Batch size for training")
     parser.add_argument('--lr', type=float, default=1e-3, help="Learning rate")
     parser.add_argument('--device', type=str, default="cuda:0", help="Device to use for training")

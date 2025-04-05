@@ -6,7 +6,30 @@ import torch.nn.functional as F
 import math
 from torch.nn.utils import spectral_norm as sn
 from torch.nn import MultiheadAttention
-from performer_pytorch import Performer 
+
+class HierarchicalAttentionPooling(nn.Module):
+    def __init__(self, hidden_dim, chunk_size=4096):
+        super().__init__()
+        self.chunk_size = chunk_size
+        # Local attention within chunks
+        self.local_attn = nn.Linear(hidden_dim, 1)
+        # Global attention over chunk summaries
+        self.global_attn = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x):
+        B, N, D = x.shape
+        # Step 1: Split into manageable chunks
+        x = x.view(B, -1, self.chunk_size, D)  # [B, num_chunks, chunk_size, D]
+        
+        # Step 2: Local attention within each chunk
+        local_weights = torch.softmax(self.local_attn(x), dim=2)  # [B, num_chunks, chunk_size, 1]
+        chunk_summaries = (x * local_weights).sum(dim=2)  # [B, num_chunks, D]
+        
+        # Step 3: Global attention across chunks
+        global_weights = torch.softmax(self.global_attn(chunk_summaries), dim=1)  # [B, num_chunks, 1]
+        pooled = (chunk_summaries * global_weights).sum(dim=1)  # [B, D]
+        
+        return pooled
 
 class PointNetEmbedding(nn.Module):
     def __init__(self, input_dim=2, latent_dim=64, hidden_dim=512):
@@ -24,16 +47,20 @@ class PointNetEmbedding(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             # nn.GroupNorm(8, hidden_dim),
-            nn.ReLU(),
+            nn.Sigmoid()
         )
         
-        # Learnable pooling (instead of just max-pooling)
-        self.pool = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1),
-            nn.Sigmoid()  # Soft weights for pooling
-        )
+        # # Learnable pooling (instead of just max-pooling)
+        # self.pool = nn.Sequential(
+        #     nn.Linear(hidden_dim, hidden_dim // 2),
+        #     nn.ReLU(),
+        #     nn.Linear(hidden_dim // 2, 1),
+        #     nn.Sigmoid()  # Soft weights for pooling
+        # )
+
+
+        # Hierarchical attention pooling for large point clouds
+        self.pool = HierarchicalAttentionPooling(hidden_dim, chunk_size=5000)
         
         # Final MLP with residual
         self.mlp2 = nn.Sequential(
@@ -48,10 +75,10 @@ class PointNetEmbedding(nn.Module):
         # Feature extraction
         x = self.mlp1(x)  # (batch_size, num_events, hidden_dim)
         
-        # Learnable pooling (weighted sum instead of max)
-        weights = self.pool(x)  # (batch_size, num_events, 1)
-        x = torch.sum(x * weights, dim=1)  # (batch_size, hidden_dim)
-        
+        # # Learnable pooling (weighted sum instead of max)
+        # weights = self.pool(x)  # (batch_size, num_events, 1)
+        # x = torch.mean(x * weights, dim=1)  # (batch_size, hidden_dim)
+        x = self.pool(x)
         # Final MLP
         latent = self.mlp2(x)  # (batch_size, latent_dim)
         return latent

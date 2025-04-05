@@ -2,9 +2,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 from models import *
 import matplotlib.pyplot as plt
+torch.cuda.empty_cache()  # After each step
 
 # Loss Function
 def nll_loss(predicted_mean, predicted_var, true_params):
@@ -83,34 +84,46 @@ def generate_data(num_samples, num_events, theta_dim=4, x_dim=2, device=torch.de
     xs_tensor = torch.tensor(xs, dtype=torch.float32, device=device)
     return thetas_tensor, xs_tensor
 
-# Custom Dataset Class
 class EventDataset(Dataset):
-    def __init__(self, event_data, param_data, pointnet_model, device):
-        self.event_data = event_data
+    def __init__(self, event_data, param_data, pointnet_model, device, batch_size=16):
         self.param_data = param_data
-        self.pointnet_model = pointnet_model
         self.device = device
 
+        # Wrap event_data in a lightweight dataset for batching
+        event_dataset = TensorDataset(event_data)
+        event_loader = DataLoader(event_dataset, batch_size=batch_size)
+
+        self.pointnet_model = pointnet_model.to(device)
+        self.pointnet_model.eval()
+
+        all_latents = []
+
+        with torch.no_grad():
+            for (batch,) in event_loader:
+                batch = batch.to(device)
+                latents = self.pointnet_model(batch).cpu()
+                all_latents.append(latents)
+                torch.cuda.empty_cache()  # After each step
+        self.latent_embeddings = torch.cat(all_latents, dim=0)
+
     def __len__(self):
-        return len(self.event_data)
+        return len(self.param_data)
 
     def __getitem__(self, idx):
-        events = self.event_data[idx].to(self.device)
-        params = self.param_data[idx].to(self.device)
-        latent_embedding = self.pointnet_model(events.unsqueeze(0).to(self.device))
+        latent_embedding = self.latent_embeddings[idx]
+        params = self.param_data[idx]
         return latent_embedding, params
-
 # Mixture Density Network (MDN)
 class MDN(nn.Module):
-    def __init__(self, latent_dim, param_dim, num_components=3):
+    def __init__(self, latent_dim, param_dim, num_components=10):
         super(MDN, self).__init__()
         self.param_dim = param_dim
         self.num_components = num_components
-        self.fc1 = nn.Linear(latent_dim, 128)
-        self.fc2 = nn.Linear(128, 64)
-        self.pi = nn.Linear(64, param_dim * num_components)
-        self.mu = nn.Linear(64, param_dim * num_components)
-        self.log_var = nn.Linear(64, param_dim * num_components)
+        self.fc1 = nn.Linear(latent_dim, 256)
+        self.fc2 = nn.Linear(256, 128)
+        self.pi = nn.Linear(128, param_dim * num_components)
+        self.mu = nn.Linear(128, param_dim * num_components)
+        self.log_var = nn.Linear(128, param_dim * num_components)
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
@@ -133,19 +146,31 @@ def mdn_loss(pi, mu, sigma, target):
     loss = -torch.mean(log_sum)
     return loss
 
-# Training Function
+# Training Function with Automatic Mixed Precision (AMP)
 def train(model, pointnet_model, dataloader, optimizer, device):
     model.train()
     total_loss = 0
+    scaler = torch.cuda.amp.GradScaler()  # AMP scaler
+
     for latent_embeddings, true_params in dataloader:
         latent_embeddings = latent_embeddings.to(device)
         true_params = true_params.to(device)
+        
         optimizer.zero_grad()
-        pi, mu, sigma = model(latent_embeddings)
-        loss = mdn_loss(pi, mu, sigma, true_params.squeeze())
+
+        # Use autocast for mixed precision during forward pass
+        with torch.cuda.amp.autocast():  # Automatic Mixed Precision
+            pi, mu, sigma = model(latent_embeddings)
+            loss = mdn_loss(pi, mu, sigma, true_params.squeeze())
+
+        # Scaler to handle the backward pass
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()  # Update the scale for next step
+
         total_loss += loss.item()
-        loss.backward()
-        optimizer.step()
+        torch.cuda.empty_cache()  # After each step
+
     return total_loss / len(dataloader)
 
 # Prediction with Uncertainty
@@ -157,52 +182,30 @@ def predict_with_uncertainty(model, latent_embedding):
         sampled_theta = mean + std * torch.randn_like(std)
     return sampled_theta, mean, std
 
-# Evaluation and Plotting
-def evaluate_and_plot(model, pointnet_model, dataloader, device):
-    model.eval()
-    true_params_list = []
-    predicted_means = []
-    predicted_stds = []
-    with torch.no_grad():
-        for latent_embeddings, true_params in dataloader:
-            latent_embeddings = latent_embeddings.to(device)
-            true_params = true_params.to(device)
-            pred_mean, pred_log_var = model(latent_embeddings)
-            pred_std = torch.exp(0.5 * pred_log_var)
-            true_params_list.append(true_params.cpu().numpy())
-            predicted_means.append(pred_mean.cpu().numpy())
-            predicted_stds.append(pred_std.cpu().numpy())
-
-    true_params_array = np.concatenate(true_params_list)
-    pred_means_array = np.concatenate(predicted_means)
-    pred_stds_array = np.concatenate(predicted_stds)
-
-    plt.figure(figsize=(10, 6))
-    for i in range(true_params_array.shape[1]):
-        plt.errorbar(
-            range(len(true_params_array)), pred_means_array[:, i],
-            yerr=2 * pred_stds_array[:, i], fmt='o', label=f'Parameter {i}'
-        )
-    plt.legend()
-    plt.xlabel('Sample index')
-    plt.ylabel('Predicted parameter values')
-    plt.title('Predicted parameters with uncertainty')
-    plt.savefig('Uncertainty.png')
-
 # Main Function
 def main():
     latent_dim = 128
     model = MDN(latent_dim, 4)
-    num_samples = 1000
-    num_events = 100000
+    num_samples = 300
+    num_events = 500000
     thetas, xs = generate_data(num_samples, num_events)
     xs_tensor_engineered = advanced_feature_engineering(xs)
     input_dim = xs_tensor_engineered.shape[-1]
     pointnet_model = PointNetEmbedding(input_dim=input_dim, latent_dim=128)
-    pointnet_model.load_state_dict(torch.load('pointnet_embedding_1000.pth'))
+    # Load the state dictionary from the file
+    state_dict = torch.load('pointnet_embedding.pth')
+
+    # Remove the 'module.' prefix from the state_dict keys
+    new_state_dict = {}
+    for key, value in state_dict.items():
+        new_key = key.replace('module.', '')  # Remove 'module.' prefix
+        new_state_dict[new_key] = value
+
+    # Load the modified state_dict into the model
+    pointnet_model.load_state_dict(new_state_dict)
     pointnet_model.eval()
 
-    optimizer = optim.Adam(model.parameters(), lr=0.0001)
+    optimizer = optim.Adam(model.parameters(), lr=0.00001)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     pointnet_model.to(device)
@@ -211,7 +214,7 @@ def main():
     dataset = EventDataset(xs_tensor, thetas, pointnet_model, device)
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
 
-    num_epochs = 300
+    num_epochs = 100000
     for epoch in range(num_epochs):
         avg_loss = train(model, pointnet_model, dataloader, optimizer, device)
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
