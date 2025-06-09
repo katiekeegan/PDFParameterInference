@@ -156,18 +156,21 @@ def evaluate_over_n_samples(model, pointnet_model, n=100, num_events=100000, dev
     # === 7. Print and plot chi-squared ===
     chi2_up = np.array(chi2_up)
     chi2_down = np.array(chi2_down)
-    print(f"Mean Chi² up: {chi2_up.mean():.4f} ± {chi2_up.std():.4f}")
-    print(f"Mean Chi² down: {chi2_down.mean():.4f} ± {chi2_down.std():.4f}")
+    print(f"Median Chi² up: {np.median(chi2_up):.4f} ± {chi2_up.std():.4f}")
+    print(f"Median Chi² down: {np.median(chi2_down):.4f} ± {chi2_down.std():.4f}")
 
+    chi2_up_clip = np.percentile(chi2_up, 99)
+    chi2_down_clip = np.percentile(chi2_down, 99)
+    
     plt.figure(figsize=(10, 5))
-    plt.hist(chi2_up, bins=50, alpha=0.6, label='Chi² Up')
-    plt.hist(chi2_down, bins=50, alpha=0.6, label='Chi² Down')
+    plt.hist(chi2_up[chi2_up < chi2_up_clip], bins=50, alpha=0.6, label='Chi² Up')
+    plt.hist(chi2_down[chi2_down < chi2_down_clip], bins=50, alpha=0.6, label='Chi² Down')
     plt.legend()
-    plt.title("Chi² Statistic Distribution")
+    plt.title("Chi² Statistic Distribution (Clipped at 99th percentile)")
     plt.xlabel("Chi²")
     plt.ylabel("Frequency")
     plt.tight_layout()
-    plt.savefig("chisq_distributions.png")
+    plt.savefig("chisq_distributions_clipped.png")
     plt.show()
 
 def enable_dropout(model):
@@ -192,13 +195,13 @@ def plot_2d_histograms(true_params, generated_params, simulator, num_events=1000
     generated_events = simulator.sample(generated_params, num_events).cpu().numpy()
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 7))
-    axes[0].scatter(true_events[:, 0], true_events[:, 1],cmap='Blues')
-    axes[0].set_title("2D Histogram - True Parameters")
+    axes[0].scatter(true_events[:, 0], true_events[:, 1],color='blue', alpha=0.2)
+    axes[0].set_title(r"$\Xi_{\theta^{*}}$")
     axes[0].set_xlabel("Sigma_p")
     axes[0].set_ylabel("Sigma_n")
 
-    axes[1].scatter(generated_events[:, 0], generated_events[:, 1], cmap='Oranges')
-    axes[1].set_title("2D Histogram - Generated Parameters")
+    axes[1].scatter(generated_events[:, 0], generated_events[:, 1], color='orange',alpha=0.2)
+    axes[1].set_title(r"$\Xi_{\hat{\theta}}$")
     axes[1].set_xlabel("Sigma_p")
     axes[1].set_ylabel("Sigma_n")
 
@@ -297,17 +300,17 @@ def plot_event_histogram(model, pointnet_model, true_params, device, n_mc=100, n
     print(f"Shape of generated_events_np: {generated_events_np.shape}")
 
     fig, axs = plt.subplots(1, 2, figsize=(15, 8))
-    axs[0].scatter(true_events_np[:, 0], true_events_np[:, 1], cmap='viridis')
-    axs[0].set_title('True Events Histogram')
-    axs[0].set_xlabel('Event X')
-    axs[0].set_ylabel('Event Y')
+    axs[0].scatter(true_events_np[:, 0], true_events_np[:, 1], color='turquoise', alpha=0.2)
+    axs[0].set_title(r"$\Xi_{\theta^{*}}$")
+    axs[0].set_xlabel(r"$x_{u} \sim u(x|\theta^{*})$")
+    axs[0].set_ylabel(r"$x_{d} \sim d(x|\theta^{*})$")
     axs[0].set_xscale("log")
     axs[0].set_yscale("log")
 
-    axs[1].scatter(generated_events_np[:, 0], generated_events_np[:, 1],cmap='viridis')
-    axs[1].set_title('Generated Events Histogram')
-    axs[1].set_xlabel('Event X')
-    axs[1].set_ylabel('Event Y')
+    axs[1].scatter(generated_events_np[:, 0], generated_events_np[:, 1], color='darkorange', alpha=0.2)
+    axs[1].set_title(r"$\Xi_{\hat{\theta}}$")
+    axs[1].set_xlabel(r"$x_{u} \sim u(x|\hat{\theta})$")
+    axs[1].set_ylabel(r"$x_{d} \sim d(x|\hat{\theta})$")
     axs[1].set_xscale("log")
     axs[1].set_yscale("log")
 
@@ -386,20 +389,19 @@ def plot_PDF_distribution_single(model, pointnet_model, true_params, device, n_m
 
     # Plot UP
     fig_up, ax_up = plt.subplots(figsize=(8, 6))
-    ax_up.plot(x_vals.cpu(), true_up_vals.cpu(), label="True up(x)", color='blue')
-    ax_up.plot(x_vals.cpu(), median_up_vals.cpu(), label="Median predicted up(x)", color='red', linestyle='--')
+    ax_up.plot(x_vals.cpu(), true_up_vals.cpu(), label=r"$u(x|\theta^{*})$", color='blue')
+    ax_up.plot(x_vals.cpu(), median_up_vals.cpu(), label=r"Median $u(x|\hat{\theta})$", color='red', linestyle='--')
     ax_up.fill_between(
         x_vals.cpu(),
         lower_up.cpu(),
         upper_up.cpu(),
         color='red',
         alpha=0.3,
-        label="IQR"
+        label="10th-90th Percentile"
     )
-    ax_up.set_title("Comparison of up(x)")
-    ax_up.set_xlabel("x")
+    ax_up.set_xlabel(r"$x$")
     ax_up.set_xscale("log")
-    ax_up.set_ylabel("up(x)")
+    ax_up.set_ylabel(r"$u(x|\theta)$")
     ax_up.set_yscale("log")
     ax_up.set_xlim(0, 1)
     ax_up.legend()
@@ -439,20 +441,19 @@ def plot_PDF_distribution_single(model, pointnet_model, true_params, device, n_m
 
     # Plot DOWN
     fig_down, ax_down = plt.subplots(figsize=(8, 6))
-    ax_down.plot(x_vals.cpu(), true_down_vals.cpu(), label="True down(x)", color='blue')
-    ax_down.plot(x_vals.cpu(), median_down_vals.cpu(), label="Median predicted down(x)", color='red', linestyle='--')
+    ax_down.plot(x_vals.cpu(), true_down_vals.cpu(), label=r"$d(x|\theta^{*})$", color='blue')
+    ax_down.plot(x_vals.cpu(), median_down_vals.cpu(), label=r"Median $d(x|\hat{\theta})$", color='red', linestyle='--')
     ax_down.fill_between(
         x_vals.cpu(),
         lower_down.cpu(),
         upper_down.cpu(),
         color='red',
         alpha=0.3,
-        label="IQR"
+        label="10th-90th Percentile"
     )
-    ax_down.set_title("Comparison of down(x)")
-    ax_down.set_xlabel("x")
+    ax_down.set_xlabel("$x$")
     ax_down.set_xscale("log")
-    ax_down.set_ylabel("down(x)")
+    ax_down.set_ylabel(r"$d(x|\theta)$")
     ax_down.set_yscale("log")
     ax_down.set_xlim(0, 1)
     ax_down.legend()
@@ -475,7 +476,7 @@ def load_model_and_data(model_path, pointnet_model_path, num_samples=100, num_ev
     input_dim = xs_tensor_engineered.shape[-1]
 
     # Instantiate the models
-    latent_dim = 1024  # Example latent dimension
+    latent_dim = 256  # Example latent dimension
     # model = ImprovedMDN(latent_dim, 4)  # Parameter dimension is 4
     model = InferenceNet(embedding_dim=latent_dim).to(device)
     pointnet_model = PointNetPMA(input_dim=input_dim, latent_dim=latent_dim)

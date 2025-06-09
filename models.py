@@ -13,7 +13,59 @@ from nflows.transforms import (
 )
 from nflows.distributions import StandardNormal
 from nflows.flows import Flow
+class InferenceNet(nn.Module):
+    def __init__(self, embedding_dim, hidden_dim=512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(embedding_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(hidden_dim, hidden_dim//2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim//2, 4)  # Output raw (unconstrained) parameters
+        )
+        self._init_weights()
+        
+        # Parameter ranges: [au, bu, ad, bd]
+        self.param_mins = torch.tensor([0.0, 0.0, 0.0, 0.0])
+        self.param_maxs = torch.tensor([5, 5, 5, 5])
+        
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                nn.init.constant_(m.bias, 0)
 
+    def forward(self, z):
+        # Get raw network output
+        params = self.net(z)
+        
+        # # Apply constraints to each parameter
+        # params = torch.zeros_like(raw_params)
+        #         #         [0.1, 5],
+        #         # [-1, -0.5],
+        #         # [0.1, 5],
+        #         # [-1, -0.5],
+        
+        # # au (0.1, 5) - use sigmoid then scale
+        # params[:, 0] = 0.1 + (5.0 - 0.1) * torch.sigmoid(raw_params[:, 0])
+        
+        # # bu (-1, -0.1) - use sigmoid then scale to negative range
+        # params[:, 1] =-1.0 + (-0.5 - (-1.0)) * torch.sigmoid(raw_params[:, 1])
+        
+        # # ad (0.1, 5) - same as au
+        # params[:, 2] = 0.1 + (5.0 - 0.1) * torch.sigmoid(raw_params[:, 2])
+        
+        # # bd (-1, -0.5) - similar to bu but different range
+        # params[:, 3] = -1.0 + (-0.5 - (-1.0)) * torch.sigmoid(raw_params[:, 3])
+        
+        return params
 
 class ConditionalRealNVP(nn.Module):
     def __init__(self, latent_dim, param_dim, hidden_dim=256, num_flows=5):
@@ -365,6 +417,73 @@ class PointNetPDFRegressor(nn.Module):
         latent = attended.view(x.size(0), -1)
         theta_hat = self.mlp2(latent)  # (B, 4)
         return theta_hat
+
+# class PointNetPMA(nn.Module):
+#     def __init__(self, input_dim=2, latent_dim=64, hidden_dim=32, num_heads=2, num_seeds=4, predict_theta=True):
+#         super().__init__()
+#         self.input_dim = input_dim
+#         self.latent_dim = latent_dim
+#         self.hidden_dim = hidden_dim
+#         self.predict_theta = predict_theta
+#         self.num_seeds = num_seeds
+
+#         # Point-wise MLP encoder with residual
+#         self.mlp1 = nn.Sequential(
+#             nn.Linear(input_dim, hidden_dim),
+#             nn.ReLU(),
+#             nn.Linear(hidden_dim, hidden_dim),
+#         )
+#         self.mlp1_bn = nn.BatchNorm1d(hidden_dim)
+
+#         # Optional deeper point-wise processing
+#         self.mlp2 = nn.Sequential(
+#             nn.Linear(hidden_dim, hidden_dim),
+#             nn.ReLU(),
+#             nn.Linear(hidden_dim, hidden_dim),
+#         )
+#         self.mlp2_bn = nn.BatchNorm1d(hidden_dim)
+
+#         # Learnable seed vectors
+#         self.seed_vectors = nn.Parameter(torch.randn(1, num_seeds, hidden_dim))
+
+#         # Multihead attention pooling
+#         self.pma = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, batch_first=True)
+
+#         # Latent projection
+#         self.latent_proj = nn.Sequential(
+#             nn.Linear(hidden_dim * num_seeds, latent_dim),
+#             nn.ReLU(),
+#             nn.Linear(latent_dim, latent_dim)
+#         )
+
+#         if predict_theta:
+#             self.theta_regressor = nn.Sequential(
+#                 nn.Linear(latent_dim, 128),
+#                 nn.ReLU(),
+#                 nn.Linear(128, 4)
+#             )
+
+#     def forward(self, x):
+#         B, N, D = x.shape
+
+#         # Point-wise feature extraction
+#         x = self.mlp1(x)
+#         x = self.mlp1_bn(x.transpose(1, 2)).transpose(1, 2)
+#         x = x + self.mlp2_bn(self.mlp2(x).transpose(1, 2)).transpose(1, 2)  # Residual
+
+#         # Seed vectors broadcast
+#         seed = self.seed_vectors.expand(B, -1, -1)
+
+#         # PMA: Query from seed, Key/Value from points
+#         attended, _ = self.pma(query=seed, key=x, value=x)  # (B, num_seeds, hidden_dim)
+
+#         # Flatten pooled output
+#         latent = self.latent_proj(attended.reshape(B, -1))
+
+#         if self.predict_theta:
+#             theta_hat = self.theta_regressor(latent)
+#             return latent, theta_hat
+#         return latent
 
 class PointNetPMA(nn.Module):
     def __init__(self, input_dim=2, latent_dim=64, hidden_dim=16, num_heads=2, num_seeds=1, predict_theta=True):

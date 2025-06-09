@@ -76,23 +76,29 @@ class SimplifiedDIS:
 
 
 class DISDataset(IterableDataset):
-    def __init__(self, simulator, num_samples, num_events, rank, world_size, theta_dim=4):
+    def __init__(self, simulator, num_samples, num_events, rank, world_size, theta_dim=4, n_repeat=2):
         self.simulator = simulator
         self.num_samples = num_samples // world_size
         self.num_events = num_events
         self.rank = rank
         self.world_size = world_size
         self.theta_bounds = torch.tensor([[0.0, 5]] * theta_dim)
+        self.n_repeat = n_repeat
 
     def __iter__(self):
         device = torch.device(f"cuda:{self.rank}")
         self.simulator.device = device
+        theta_bounds = self.theta_bounds.to(device)
+
         for _ in range(self.num_samples):
-            theta = torch.rand(self.theta_bounds.size(0), device=device)
-            theta = theta * (self.theta_bounds[:, 1] - self.theta_bounds[:, 0]) + self.theta_bounds[:, 0]
-            x = self.simulator.sample(theta, self.num_events)
-            x_feat = feature_engineering(x)
-            yield theta.cpu(), x_feat.cpu()
+            theta = torch.rand(theta_bounds.size(0), device=device)
+            theta = theta * (theta_bounds[:, 1] - theta_bounds[:, 0]) + theta_bounds[:, 0]
+            xs = []
+            for _ in range(self.n_repeat):
+                x = self.simulator.sample(theta, self.num_events)
+                xs.append(feature_engineering(x).cpu())
+
+            yield theta.cpu(), torch.stack(xs)  # [n_repeat, num_points, feature_dim]
 
 
 def feature_engineering(x):
@@ -110,18 +116,85 @@ def feature_engineering(x):
 
     return torch.cat([log_features, symlog] + ratios + diffs, dim=-1)
 
+def contrastive_loss_fn(z, theta, temperature=0.1, sim_threshold=0.15, dissim_threshold=0.35, margin=1.0, scale=2.0):
+    # Normalize latent set-level embeddings
+    z = F.normalize(z, dim=-1)  # [B, d]
+    
+    # Cosine similarity matrix
+    sim_matrix = torch.matmul(z, z.T)  # [B, B]
+    
+    # Compute parameter distances between theta vectors
+    theta_dists = torch.cdist(theta, theta, p=2)
+    theta_dists = theta_dists / (theta_dists.max() + 1e-8)
 
-def contrastive_loss_fn(latent, theta, margin=1.0, scale=2.0):
-    latent = F.normalize(latent, p=2, dim=-1)
-    emb_dists = 1.0 - torch.mm(latent, latent.t())
-    theta_dists = torch.cdist(theta, theta) / (theta_dists.max() + 1e-8)
-    sim_mask = (theta_dists < 0.15).float()
-    dissim_mask = (theta_dists > 0.35).float()
+    # Define positive/negative masks
+    pos_mask = (theta_dists < sim_threshold).float()
+    neg_mask = (theta_dists > dissim_threshold).float()
 
-    sim_loss = (sim_mask * emb_dists).mean()
-    dissim_loss = (dissim_mask * F.relu(margin - emb_dists)).mean()
-    return (sim_loss + scale * dissim_loss) / (1 + scale)
+    # Remove self-pairs
+    diag_mask = torch.eye(sim_matrix.size(0), device=sim_matrix.device)
+    pos_mask *= (1 - diag_mask)
+    neg_mask *= (1 - diag_mask)
 
+    # Compute distances for positive pairs (contrastive loss part 1)
+    pos_loss = (1 - sim_matrix) * pos_mask
+    pos_loss = pos_loss.sum() / (pos_mask.sum() + 1e-8)
+
+    # For negative pairs, use hinge loss with margin
+    neg_margin = F.relu(margin - (1 - sim_matrix)) * neg_mask
+    neg_loss = neg_margin.sum() / (neg_mask.sum() + 1e-8)
+
+    total = (pos_loss + scale * neg_loss) / (1 + scale)
+    return total
+
+def triplet_theta_contrastive_loss(z, theta, margin=0.5, sim_threshold=0.05, dissim_threshold=0.1):
+    """
+    z: [B, d] - normalized embeddings
+    theta: [B, d_theta] - ground-truth parameters
+    """
+    z = F.normalize(z, dim=-1)
+    theta_dists = torch.cdist(theta, theta, p=2)
+    theta_dists = theta_dists / (theta_dists.max() + 1e-8)
+
+    B = z.size(0)
+    losses = []
+
+    for i in range(B):
+        anchor = z[i]
+        pos_mask = (theta_dists[i] < sim_threshold)
+        neg_mask = (theta_dists[i] > dissim_threshold)
+
+        pos_indices = pos_mask.nonzero(as_tuple=True)[0]
+        neg_indices = neg_mask.nonzero(as_tuple=True)[0]
+
+        if len(pos_indices) == 0 or len(neg_indices) == 0:
+            continue
+
+        # Choose hardest positive (farthest in embedding space)
+        pos_embs = z[pos_indices]
+        pos_dists = F.pairwise_distance(anchor.unsqueeze(0), pos_embs)
+        hardest_pos = pos_embs[pos_dists.argmax()]
+
+        # Choose hardest negative (closest in embedding space)
+        neg_embs = z[neg_indices]
+        neg_dists = F.pairwise_distance(anchor.unsqueeze(0), neg_embs)
+        hardest_neg = neg_embs[neg_dists.argmin()]
+
+        # Triplet loss: max(d(anchor, pos) - d(anchor, neg) + margin, 0)
+        triplet_loss = F.triplet_margin_loss(
+            anchor.unsqueeze(0),
+            hardest_pos.unsqueeze(0),
+            hardest_neg.unsqueeze(0),
+            margin=margin,
+            reduction='none'
+        )
+
+        losses.append(triplet_loss)
+
+    if len(losses) == 0:
+        return torch.tensor(0.0, device=z.device, requires_grad=True)
+
+    return torch.cat(losses).mean()
 
 def train(model, dataloader, epochs, lr, rank, wandb_enabled):
     device = next(model.parameters()).device
@@ -129,20 +202,31 @@ def train(model, dataloader, epochs, lr, rank, wandb_enabled):
     scaler = torch.cuda.amp.GradScaler()
     alpha1, alpha2 = 0.01, 0.01
 
+    if wandb_enabled and rank == 0:
+        import wandb
+        wandb.init(project="quantom_cl")
+
     for epoch in range(epochs):
         model.train()
         total_loss = 0.0
-        for theta, x in dataloader:
-            theta, x = theta.to(device), x.to(device)
+        for theta, x_sets in dataloader:
+            B, n_repeat, num_points, feat_dim = x_sets.shape
+            x_sets = x_sets.view(B * n_repeat, num_points, feat_dim)  # Flatten
+            theta = theta.repeat_interleave(n_repeat, dim=0)
+
+            theta, x_sets = theta.to(device), x_sets.to(device)
             opt.zero_grad()
             with torch.cuda.amp.autocast():
-                latent = model(x)
-                loss = contrastive_loss_fn(latent, theta)
-                loss += alpha1 * latent.norm(p=2, dim=1).mean()
+                latent = model(x_sets)  # [B*n_repeat, latent_dim]
+                contrastive = triplet_theta_contrastive_loss(latent, theta)
+
+                l2_reg = latent.norm(p=2, dim=1).mean()
                 z = latent - latent.mean(dim=0)
                 cov = (z.T @ z) / (z.size(0) - 1)
                 decorrelation = ((cov * (1 - torch.eye(cov.size(0), device=cov.device))) ** 2).sum()
-                loss += alpha2 * decorrelation
+
+                loss = contrastive + alpha1 * l2_reg + alpha2 * decorrelation
+
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
@@ -154,6 +238,8 @@ def train(model, dataloader, epochs, lr, rank, wandb_enabled):
 
     if rank == 0:
         torch.save(model.state_dict(), "final_model.pth")
+
+
 
 
 def setup(rank, world_size):
@@ -181,11 +267,11 @@ def main_worker(rank, world_size, args):
     model = PointNetPMA(input_dim=input_dim, latent_dim=args.latent_dim, predict_theta=True).to(device)
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model = DDP(model, device_ids=[rank])
-
+ 
     if rank == 0 and args.wandb:
         wandb.init(project="quantom_cl", config=vars(args))
 
-    train(model, dataloader, args.num_epochs, args.lr, rank, args.wandb)
+    train(model, dataloader, args.num_epochs, args.lr, rank, True)
     cleanup()
 
 
