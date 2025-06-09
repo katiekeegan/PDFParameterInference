@@ -1,321 +1,201 @@
-# Benchmark your parton distribution inference problem with SBIBM
-# using multiple state-of-the-art SBI algorithms
-
-import sbibm
-from sbibm.tasks.task import Task
-from sbibm.algorithms import snle,snpe,snre, rej_abc
-from sbibm.metrics import c2st
 import torch
-import os
 from torch.distributions import Uniform
-from typing import Callable, List, Tuple, Optional
+from sbi.inference import simulate_for_sbi, prepare_for_sbi, SNPE, MCABC
+from sbi.utils.get_nn_models import posterior_nn
+from sbi.utils.torchutils import BoxUniform
+import numpy as np
+from scipy.stats import wasserstein_distance
 
-class SimplifiedDIS:
-    def __init__(self, device=None, smear=False, smear_std=0.05, num_samples=1):
-        self.device = device or torch.device("cpu")
-        self.smear = smear
-        self.smear_std = smear_std
-        self.num_samples = num_samples
+import torch
+from torch.distributions import Uniform
+from sbi.inference import simulate_for_sbi, prepare_for_sbi, MCABC
+import numpy as np
 
-    def init(self, params):
-        self.au, self.bu, self.ad, self.bd = [p.to(self.device) for p in params]
+########################
+# PRIOR OVER PARAMETERS
+########################
+prior = torch.distributions.Independent(
+    Uniform(low=torch.zeros(4), high=5 * torch.ones(4)), 1
+)
+
+########################
+# KERNEL DISTANCE BETWEEN POINT CLOUDS
+########################
+def pairwise_squared_dist(x, y):
+    # x: [N, D], y: [M, D]
+    x2 = x.pow(2).sum(dim=1, keepdim=True)  # [N, 1]
+    y2 = y.pow(2).sum(dim=1, keepdim=True).T  # [1, M]
+    xy = x @ y.T  # [N, M]
+    return x2 - 2 * xy + y2  # [N, M]
+
+def kernel(x, y, sigma=1.0):
+    dists = pairwise_squared_dist(x, y)
+    return torch.exp(-dists / (2 * sigma**2))
+
+def kernel_mean_embedding(x, y, sigma=1.0):
+    kxx = kernel(x, x, sigma).mean()
+    kyy = kernel(y, y, sigma).mean()
+    kxy = kernel(x, y, sigma).mean()
+    return kxx + kyy - 2 * kxy
+
+def custom_distance(x1, x2):
+    return kernel_mean_embedding(x1, x2, sigma=1.0)
+@torch.no_grad()
+def simulator(theta):
+    """
+    theta: shape [4] (single parameter sample)
+    returns: point cloud of shape [N_events, 6]
+    """
+    # Replace this with your actual DIS simulation logic
+    # For now, we'll mock something realistic
+    N = 100000
 
     def up(self, x):
-        return (x ** self.au) * ((1 - x) ** self.bu)
+        return self.Nu * (x ** self.au) * ((1 - x) ** self.bu)
 
     def down(self, x):
-        return (x ** self.ad) * ((1 - x) ** self.bd)
+        return self.Nd * (x ** self.ad) * ((1 - x) ** self.bd)
 
-    def __call__(self, params, num_samples=1):
-        if params.ndim == 1:
-            params = params.unsqueeze(0)  # shape (1, dim)
-        out = []
-        for p in params:
-            self.init(p)
-            eps = 1e-6
-            rand = lambda: torch.clamp(torch.rand(num_samples, device=self.device), min=eps, max=1 - eps)
-            smear_noise = lambda s: s + torch.randn_like(s) * (self.smear_std * s) if self.smear else s
-            xs_p, xs_n = rand(), rand()
-            sigma_p = smear_noise(4 * self.up(xs_p) + self.down(xs_p))
-            sigma_n = smear_noise(4 * self.down(xs_n) + self.up(xs_n))
-            out.append(torch.stack([sigma_p, sigma_n], dim=-1).squeeze(0))
-        return torch.stack(out)
+    xs_p = torch.rand(N, device=self.device)
+    sigma_p = 4 * up(xs_p) + down(xs_p)
+    sigma_p = torch.nan_to_num(sigma_p, nan=0.0)
 
-# === Define Your Task ===
-class PDFTask(Task):
-    def __init__(self, name="pdf_sim", num_observation=1):
-        super().__init__(
-            name=name,
-            dim_data=2,
-            dim_parameters=4,
-            num_observations=num_observation,
-            num_posterior_samples=1000,
-            num_simulations=1000,
-            path="/tmp"  # or another directory you have write access to
-        )
-        self.prior = torch.distributions.Uniform(torch.zeros(4), torch.ones(4) * 5.0)
+    xs_n = torch.rand(N, device=self.device)
+    sigma_n = 4 * down(xs_n) + up(xs_n)
+    sigma_n = torch.nan_to_num(sigma_n, nan=0.0)
 
-    def get_simulator(self, max_calls= None):
-        sim = SimplifiedDIS(torch.device("cpu"))
-        def simulator(theta):
-            return sim(theta)
-        return simulator
+    x = torch.cat([sigma_p.unsqueeze(0), sigma_n.unsqueeze(0)], dim=0).t()
+    # x = torch.randn(N, 6) + theta[None, 0].item()  # use θ₁ as offset
+    return x.float()
 
-    def get_prior_dist(self):
-        return self.prior
+def simulator_batch(theta_batch):
+    """
+    theta_batch: shape [B, 4]
+    returns: list of [N_events, 6] tensors, each as an observation
+    """
+    return [simulator(theta[i]) for i in range(theta_batch.shape[0])]
 
-    def get_prior(self):
-        return self.prior
+########################
+# SBI PIPELINE
+########################
+if __name__ == "__main__":
+    # Wrap simulator + prepare prior
+    def wrapped_simulator(theta_batch):
+        # return a list of tensors, which simulate_for_sbi will accept
+        return simulator_batch(theta_batch)
 
-    def get_observation(self, seed, num_samples=1):
-        # torch.manual_seed(seed)
-        theta = self.get_prior().sample()
-        x = self.get_simulator()(theta)
-        return x.squeeze(), theta
+    wrapped_simulator, wrapped_prior = prepare_for_sbi(wrapped_simulator, prior)
 
+    # Simulate training data
+    num_simulations = 500  # Keep this manageable
+    theta, x = simulate_for_sbi(wrapped_simulator, wrapped_prior, num_simulations=num_simulations)
 
-# # === Task and Output Setup ===
-task = PDFTask()
+    # Define inference method with custom distance
+    inference = MCABC(prior=wrapped_prior, simulator=wrapped_simulator, distance=custom_distance)
 
-from sbi.inference.abc.mcabc import MCABC as RejectionABC
+    # True parameter and observed data
+    true_theta = torch.tensor([1.0, 2.0, 0.5, 4.0])
+    x_o = simulator(true_theta)
 
-x_obs, true_theta = task.get_observation(0)
-x_obs = x_obs.view(1, -1).float()
+    # Run inference
+    posterior = inference(x_o)
 
-simulator = task.get_simulator()
-prior = task.get_prior()
+    # Sample from posterior
+    samples = posterior.sample((1000,))
+    print("Posterior mean:", samples.mean(dim=0))
+    print("Posterior std:", samples.std(dim=0))
 
-# abc = RejectionABC(prior=prior, simulator=simulator)
-# posterior = abc(x_o=x_obs, num_simulations=1000000,quantile=0.01)
-# print(posterior)
-# print(f"TRUE: {true_theta}")
+def histogram_summary(x, nbins=32, range_min=-10, range_max=10):
+    """
+    Convert point cloud [N, D] to a fixed-size vector [D * nbins].
+    - Bins are the same for every x.
+    - Histogram is normalized per feature.
+    """
+    D = x.shape[1]
+    summaries = []
 
-from sbi.inference.base import infer
-# prior = [
-#                             Uniform(torch.zeros(1), 5 * torch.ones(1)),
-#                             Uniform(torch.zeros(1), 5 * torch.ones(1)),
-#                             Uniform(torch.zeros(1), 5 * torch.ones(1)),
-#                             Uniform(torch.zeros(1), 5 * torch.ones(1))
-#                         ]
-# posterior = infer(simulator, prior, "SNPE", num_simulations=100000)
-# samples = posterior.sample((100,),x=x_obs)
+    for d in range(D):
+        # Use torch.histc for fast binning
+        hist = torch.histc(x[:, d], bins=nbins, min=range_min, max=range_max)
+        hist = hist / (hist.sum() + 1e-8)  # normalize to sum to 1
+        summaries.append(hist)
 
-from sbi.inference import SNPE_A
+    return torch.cat(summaries, dim=0)  # shape: [D * nbins]
 
-prior = torch.distributions.Uniform(torch.zeros(4), torch.ones(4) * 5.0)
-num_sims=100000
-# inference = SNPE_A(prior)
+def snpe_benchmark(simulator, prior, nbins=32):
+    def sim_fn(theta):
+        return histogram_summary(simulator(theta), nbins=nbins)
 
-# SNRE A
+    # Wrap simulator and prior
+    sim_fn_wrapped, prior_wrapped = prepare_for_sbi(sim_fn, prior)
 
-# proposal = prior
-# from sbi.inference import SNRE_A
+    # Simulate training data
+    theta, x = simulate_for_sbi(sim_fn_wrapped, prior_wrapped, num_simulations=1000)
 
-# inference = SNRE_A(prior)
-# theta = prior.sample((num_sims,))
-# x = simulator(theta)
-# _ = inference.append_simulations(theta, x).train()
-# posterior = inference.build_posterior().set_default_x(x_o)
+    # Inference
+    inference = SNPE(prior_wrapped)
+    density_estimator = inference.append_simulations(theta, x).train()
+    posterior = inference.build_posterior(density_estimator)
 
-# from sbi.inference import simulate_for_sbi, prepare_for_sbi, MCABC
-# import torch
+    return posterior
 
-# # Define your prior and simulator
-# # prior = ...  # Some sbi-compatible torch distribution
-# # simulator = ...  # A simulator that takes theta and returns x
-# # Simulate data
-# num_sims = 100000
-# theta, x = simulate_for_sbi(simulator, prior, num_simulations=num_sims)
-# prior = [
-#                             Uniform(torch.zeros(1), 5 * torch.ones(1)),
-#                             Uniform(torch.zeros(1), 5 * torch.ones(1)),
-#                             Uniform(torch.zeros(1), 5 * torch.ones(1)),
-#                             Uniform(torch.zeros(1), 5 * torch.ones(1))
-#                         ]
-# # Prepare for inference (needed to wrap the simulator correctly)
-# simulator, prior = prepare_for_sbi(simulator, prior)
+def sliced_wasserstein(x1, x2, num_projections=50):
+    """
+    x1, x2: [N, D]
+    Returns: average 1D Wasserstein distance
+    """
+    d = x1.shape[1]
+    distances = []
+    for _ in range(num_projections):
+        proj = torch.randn(d)
+        proj = proj / torch.norm(proj)
+        x1_proj = x1 @ proj
+        x2_proj = x2 @ proj
+        w = wasserstein_distance(x1_proj.cpu().numpy(), x2_proj.cpu().numpy())
+        distances.append(w)
+    return np.mean(distances)
 
-# x_o = simulator(true_theta)  # your observed data
+def wasserstein_distance_wrapper(x1, x2):
+    return sliced_wasserstein(x1, x2)
 
-# # Run ABC inference
-# inference = MCABC(prior=prior, simulator=simulator, distance="l2")
+def wasserstein_abc_benchmark(simulator, prior):
+    # Wrap for sbi
+    def sim_fn_batch(theta_batch):
+        return [simulator(theta) for theta in theta_batch]
 
-# # Get posterior conditioned on observation (uses internal sampling)
-# samples = inference(x_o, num_simulations=10000000, eps=0.1)
+    sim_fn_wrapped, prior_wrapped = prepare_for_sbi(sim_fn_batch, prior)
 
-# print(f"TRUE: {true_theta}")
-# print(f"GENERATED: {samples.median(dim=0)}")
+    inference = MCABC(prior=prior_wrapped, simulator=sim_fn_wrapped, distance=wasserstein_distance_wrapper)
 
-def rejection_abc_iid(
-    simulator: Callable,
-    prior: List[torch.distributions.Distribution],
-    x_obs_list: List[torch.Tensor],  # List of observed datasets
-    num_sims: int = 10000,
-    eps: float = 0.1,
-    distance_fn: Callable = lambda x, y: torch.norm(x - y, p=2)
-) -> torch.Tensor:
-    theta_samples = torch.stack([p.sample((num_sims,)) for p in prior], dim=1)
-    accepted = []
-    
-    for theta in theta_samples:
-        # Simulate one dataset per theta (same size as x_obs_list)
-        x_sim_list = [simulator(theta) for _ in range(len(x_obs_list))]
-        
-        # Check distance for all observations
-        if all(distance_fn(x_sim, x_obs) <= eps for x_sim, x_obs in zip(x_sim_list, x_obs_list)):
-            accepted.append(theta)
-    
-    return torch.stack(accepted) if accepted else torch.zeros(0, len(prior))
+    true_theta = torch.tensor([1.0, 2.0, 0.5, 4.0])
+    x_o = simulator(true_theta)
 
-def rejection_abc_iid(
-    simulator: Callable,
-    prior: List[torch.distributions.Distribution],
-    x_obs_list: List[torch.Tensor],  # List of observed datasets
-    num_sims: int = 10000,
-    eps: float = 0.1,
-    distance_fn: Callable = lambda x, y: torch.norm(x - y, p=2)
-) -> torch.Tensor:
-    theta_samples = torch.stack([p.sample((num_sims,)) for p in prior], dim=1)
-    accepted = []
-    
-    for theta in theta_samples:
-        # Simulate one dataset per theta (same size as x_obs_list)
-        x_sim_list = [simulator(theta) for _ in range(len(x_obs_list))]
-        
-        # Check distance for all observations
-        if all(distance_fn(x_sim, x_obs) <= eps for x_sim, x_obs in zip(x_sim_list, x_obs_list)):
-            accepted.append(theta)
-    
-    return torch.stack(accepted) if accepted else torch.zeros(0, len(prior))
+    posterior = inference(x_o)
+    return posterior
 
-def hierarchical_abc(
-    simulator: Callable,  # Simulator takes (theta, phi_i)
-    prior_theta: List[torch.distributions.Distribution],
-    prior_phi: Callable,  # Function of theta, e.g., lambda theta: Normal(theta, 1)
-    x_obs_list: List[torch.Tensor],
-    num_sims: int = 10000,
-    eps: float = 0.1
-) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-    theta_samples = torch.stack([p.sample((num_sims,)) for p in prior_theta], dim=1)
-    accepted_theta = []
-    accepted_phi = [[] for _ in x_obs_list]
-    
-    for theta in theta_samples:
-        phi_list = [prior_phi(theta).sample() for _ in x_obs_list]
-        x_sim_list = [simulator(theta, phi) for phi in phi_list]
-        
-        if all(torch.norm(x_sim - x_obs) <= eps for x_sim, x_obs in zip(x_sim_list, x_obs_list)):
-            accepted_theta.append(theta)
-            for i, phi in enumerate(phi_list):
-                accepted_phi[i].append(phi)
-    
-    return torch.stack(accepted_theta), [torch.stack(phi) for phi in accepted_phi]
+if __name__ == "__main__":
+    # Define prior
+    prior = BoxUniform(low=torch.zeros(4), high=5 * torch.ones(4))
 
-def pseudo_marginal_mcmc(
-    simulator: Callable,
-    prior: List[torch.distributions.Distribution],
-    x_obs_list: List[torch.Tensor],
-    num_mcmc_steps: int = 10000,
-    num_sims_per_step: int = 100,  # Simulations per theta
-    eps: float = 0.1
-) -> torch.Tensor:
-    theta_current = torch.stack([p.sample() for p in prior])
-    log_prior_current = sum([p.log_prob(theta_current[i]).item() for i, p in enumerate(prior)])
-    
-    samples = []
-    for _ in range(num_mcmc_steps):
-        theta_proposed = theta_current + 0.1 * torch.randn_like(theta_current)
-        log_prior_proposed = sum([p.log_prob(theta_proposed[i]).item() for i, p in enumerate(prior)])
-        
-        # Approximate likelihood for all x_obs
-        log_likelihood = 0.0
-        for x_obs in x_obs_list:
-            x_sim = torch.stack([simulator(theta_proposed) for _ in range(num_sims_per_step)])
-            log_likelihood += torch.log(torch.mean(torch.norm(x_sim - x_obs, dim=1) <= eps) + 1e-6)
-        
-        # Accept/reject
-        if torch.rand(1) < torch.exp(log_prior_proposed + log_likelihood - log_prior_current):
-            theta_current = theta_proposed
-            log_prior_current = log_prior_proposed
-        
-        samples.append(theta_current.clone())
-    return torch.stack(samples)
+    # Define true observation
+    true_theta = torch.tensor([1.0, 2.0, 0.5, 4.0])
+    x_o = simulator(true_theta)
 
-# pseudo_marginal_mcmc
+    ### 1. MCABC with kernel
+    print("Running MCABC (kernel MMD)...")
+    posterior_mmd = MCABC(prior, simulator, distance=custom_distance)(x_o)
+    samples_mmd = posterior_mmd.sample((1000,))
+    print("MMD Posterior mean:", samples_mmd.mean(0))
 
-# x_obs_list = [task.get_observation(i)[0] for i in range(3)]  # Get 3 observations
-# x_obs, true_theta = task.get_observation(1, num_samples=100000)
-true_theta = task.get_prior().sample()
-simulator =  SimplifiedDIS(torch.device("cpu"))
-x_obs_list = simulator(true_theta, num_samples=100000)
+    ### 2. SNPE (histograms)
+    print("Running SNPE (histograms)...")
+    posterior_snpe = snpe_benchmark(simulator, prior)
+    x_o_hist = histogram_summary(x_o)
+    samples_snpe = posterior_snpe.sample((1000,), x=x_o_hist)
+    print("SNPE Posterior mean:", samples_snpe.mean(0))
 
-def rejection_abc_multi(task, x_obs_list, num_sims=1000000, eps=0.1):
-    simulator = task.get_simulator()
-    prior = task.get_prior()
-    
-    theta_samples = prior.sample((num_sims,))
-    accepted = []
-    
-    for theta in theta_samples:
-        # Simulate one dataset per theta
-        x_sim = simulator(theta.unsqueeze(0)).squeeze(0)
-        
-        # Check distance for all observations
-        if all(torch.norm(x_sim - x_obs) <= eps for x_obs in x_obs_list):
-            print("Accepted!")
-            accepted.append(theta)
-    
-    return torch.stack(accepted) if accepted else torch.zeros(0, task.dim_parameters)
-
-def distance_summary(x1, x2):
-    """Compare means and variances of sigma_p/sigma_n ratios"""
-    ratio1 = x1[..., 0] / x1[..., 1]  # sigma_p / sigma_n for x1
-    ratio2 = x2[..., 0] / x2[..., 1]  # sigma_p / sigma_n for x2
-    return torch.abs(ratio1.mean() - ratio2.mean()) + torch.abs(ratio1.var() - ratio2.var())
-
-def rejection_abc_summary(task, x_obs_list, num_sims=10000, eps=0.5):
-    theta_samples = task.get_prior().sample((num_sims,))
-    x_obs_stack = torch.stack(x_obs_list)
-    accepted = []
-    
-    for theta in theta_samples:
-        x_sim = task.get_simulator()(theta.unsqueeze(0)).squeeze(0).repeat(len(x_obs_list), 1)
-        if distance_summary(x_sim, x_obs_stack) <= eps:
-            accepted.append(theta)
-    
-    return torch.stack(accepted)
-
-def rejection_abc_multi_relaxed(task, x_obs_list, num_sims=10000, eps=0.5, min_matches=1):
-    theta_samples = task.get_prior().sample((num_sims,))
-    accepted = []
-    
-    for theta in theta_samples:
-        x_sim = task.get_simulator()(theta.unsqueeze(0)).squeeze(0)
-        matches = sum(torch.norm(x_sim - x_obs) <= eps for x_obs in x_obs_list)
-        if matches >= min_matches:  # Accept if at least 'min_matches' observations agree
-            print("Accepted!")
-            accepted.append(theta)
-    
-    return torch.stack(accepted) if accepted else torch.zeros(0, task.dim_parameters)
-
-
-def hierarchical_abc(task, x_obs_list, num_sims=10000, eps=0.2):
-    theta_samples = task.get_prior().sample((num_sims,))
-    accepted = []
-    
-    for theta in theta_samples:
-        # Simulate small perturbations around theta
-        theta_perturbed = theta + 0.1 * torch.randn(len(x_obs_list), task.dim_parameters)
-        x_sim = task.get_simulator()(theta_perturbed)
-        
-        # Check if all perturbed simulations match observations
-        if all(torch.norm(x_sim[i] - x_obs_list[i]) <= eps for i in range(len(x_obs_list))):
-            accepted.append(theta)
-    
-    return torch.stack(accepted)
-
-# Usage: Accept if at least 1/3 observations match
-samples = rejection_abc_multi_relaxed(task, x_obs_list, min_matches=100)
-
-# multi_samples = rejection_abc_multi(task, x_obs_list)
-print(f"Multi-observation accepted: {len(samples)} samples")
+    ### 3. Wasserstein ABC
+    print("Running Wasserstein ABC...")
+    posterior_wasserstein = wasserstein_abc_benchmark(simulator, prior)
+    samples_wass = posterior_wasserstein.sample((1000,))
+    print("Wasserstein Posterior mean:", samples_wass.mean(0))
