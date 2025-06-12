@@ -318,28 +318,147 @@ def plot_event_histogram(model, pointnet_model, true_params, device, n_mc=100, n
     plt.savefig("histograms.png")
     plt.show()
 
-def plot_params_distribution_single(model, pointnet_model, true_params, device, n_mc=100):
+# def plot_params_distribution_single(model, pointnet_model, true_params, device, n_mc=100, compare_with_sbi=False):
+#     model.eval()
+#     pointnet_model.eval()
+#     simulator = SimplifiedDIS(torch.device('cpu'))
+
+#     true_params = true_params.to(device)
+#     xs = simulator.sample(true_params.cpu(), 100000).to(device)
+#     xs_tensor = torch.tensor(xs, dtype=torch.float32, device=device)
+#     xs_tensor = advanced_feature_engineering(xs_tensor)
+#     latent_embedding = pointnet_model(xs_tensor.unsqueeze(0))
+
+#     samples = sample_with_mc_dropout(model, latent_embedding, n_samples=n_mc).squeeze()
+
+#     fig, axes = plt.subplots(1, true_params.size(0), figsize=(20, 4))
+#     for i in range(true_params.size(0)):
+#         axes[i].hist(samples[:, i].cpu().numpy(), bins=20, alpha=0.7, color='skyblue')
+#         axes[i].axvline(true_params[i].item(), color='red', linestyle='dashed', label='True Value')
+#         axes[i].set_title(f'Param {i+1}')
+#         axes[i].legend()
+
+#     plt.tight_layout()
+#     plt.savefig("Dist.png")
+#     plt.show()
+
+# def plot_params_distribution_single(
+#     model,
+#     pointnet_model,
+#     true_params,
+#     device,
+#     n_mc=100,
+#     compare_with_sbi=False,
+#     sbi_posteriors=None,  # list of tensors
+#     sbi_labels=None       # list of strings
+# ):
+#     model.eval()
+#     pointnet_model.eval()
+#     simulator = SimplifiedDIS(torch.device('cpu'))
+
+#     true_params = true_params.to(device)
+
+#     # Simulate data + feature engineering
+#     xs = simulator.sample(true_params.cpu(), 100000).to(device)
+#     xs_tensor = torch.tensor(xs, dtype=torch.float32, device=device)
+#     xs_tensor = advanced_feature_engineering(xs_tensor)
+#     latent_embedding = pointnet_model(xs_tensor.unsqueeze(0))
+
+#     # MC Dropout samples
+#     samples = sample_with_mc_dropout(model, latent_embedding, n_samples=n_mc).squeeze()
+
+#     # Plotting
+#     fig, axes = plt.subplots(1, true_params.size(0), figsize=(4 * true_params.size(0), 4))
+
+#     for i in range(true_params.size(0)):
+#         # MC Dropout histogram
+#         axes[i].hist(samples[:, i].cpu().numpy(), bins=20, alpha=0.5, color='skyblue', label='MC Dropout')
+
+#         # Overlay SBI posteriors if provided
+#         if compare_with_sbi and sbi_posteriors is not None and sbi_labels is not None:
+#             colors = ['orange', 'green', 'purple', 'gray']
+#             for j, sbi_samples in enumerate(sbi_posteriors):
+#                 axes[i].hist(sbi_samples[:, i].cpu().numpy(), bins=20, alpha=0.4, color=colors[j % len(colors)], label=sbi_labels[j])
+
+#         # True value
+#         axes[i].axvline(true_params[i].item(), color='red', linestyle='dashed', label='True Value')
+#         axes[i].set_title(f'Param {i+1}')
+#         axes[i].legend()
+
+#     plt.tight_layout()
+#     plt.savefig("Dist.png")
+#     plt.show()
+
+def plot_params_distribution_single(
+    model,
+    pointnet_model,
+    true_params,
+    device,
+    n_mc=100,
+    compare_with_sbi=False,
+    sbi_posteriors=None,  # list of tensors
+    sbi_labels=None,      # list of strings
+    save_path="Dist.png"
+):
     model.eval()
     pointnet_model.eval()
     simulator = SimplifiedDIS(torch.device('cpu'))
 
     true_params = true_params.to(device)
+
+    # Simulate data + feature engineering
     xs = simulator.sample(true_params.cpu(), 100000).to(device)
     xs_tensor = torch.tensor(xs, dtype=torch.float32, device=device)
     xs_tensor = advanced_feature_engineering(xs_tensor)
     latent_embedding = pointnet_model(xs_tensor.unsqueeze(0))
 
+    # MC Dropout samples
     samples = sample_with_mc_dropout(model, latent_embedding, n_samples=n_mc).squeeze()
 
-    fig, axes = plt.subplots(1, true_params.size(0), figsize=(20, 4))
-    for i in range(true_params.size(0)):
-        axes[i].hist(samples[:, i].cpu().numpy(), bins=20, alpha=0.7, color='skyblue')
+    # Combine all posterior samples for consistent x-limits
+    all_samples = [samples.cpu()]
+    if compare_with_sbi and sbi_posteriors is not None:
+        all_samples.extend([s.cpu() for s in sbi_posteriors])
+    
+    n_params = true_params.size(0)
+    fig, axes = plt.subplots(1, n_params, figsize=(4 * n_params, 4))
+
+    if n_params == 1:
+        axes = [axes]
+
+    colors = ['skyblue', 'orange', 'green', 'purple', 'gray']
+    
+    for i in range(n_params):
+        # Compute global min/max across all samples for this parameter
+        param_vals = [s[:, i].numpy() for s in all_samples]
+        xmin = min([v.min() for v in param_vals])
+        xmax = max([v.max() for v in param_vals])
+        padding = 0.05 * (xmax - xmin)
+        xmin -= padding
+        xmax += padding
+
+        # MC Dropout
+        axes[i].hist(samples[:, i].cpu().numpy(), bins=20, alpha=0.6, density=True, color=colors[0], label='Ours')
+
+        # SBI posteriors
+        if compare_with_sbi and sbi_posteriors is not None and sbi_labels is not None:
+            for j, sbi_samples in enumerate(sbi_posteriors):
+                label = sbi_labels[j] if j < len(sbi_labels) else f"SBI {j}"
+                axes[i].hist(
+                    sbi_samples[:, i].cpu().numpy(),
+                    bins=20, alpha=0.4, density=True,
+                    color=colors[(j + 1) % len(colors)],
+                    label=label
+                )
+
+        # True value
         axes[i].axvline(true_params[i].item(), color='red', linestyle='dashed', label='True Value')
+        axes[i].set_xlim(xmin, xmax)
         axes[i].set_title(f'Param {i+1}')
         axes[i].legend()
 
     plt.tight_layout()
-    plt.savefig("Dist.png")
+    plt.savefig(save_path)
     plt.show()
 
 def plot_PDF_distribution_single(model, pointnet_model, true_params, device, n_mc=100):
@@ -539,8 +658,21 @@ def main():
     # Load the model and data
     model, pointnet_model, dataloader, device = load_model_and_data(model_path, pointnet_model_path)
     true_params = torch.tensor([1.0, 0.5, 1.2, 0.5])
-    plot_params_distribution_single(model, pointnet_model, true_params, device, n_mc=1000)
-    plot_PDF_distribution_single(model, pointnet_model, true_params, device, n_mc=1000)
+    # plot_params_distribution_single(model, pointnet_model, true_params, device, n_mc=100)
+    samples_snpe = torch.tensor(np.loadtxt("samples_snpe.txt"), dtype=torch.float32)
+    samples_wass = torch.tensor(np.loadtxt("samples_wasserstein.txt"), dtype=torch.float32)
+    samples_mmd = torch.tensor(np.loadtxt("samples_mmd.txt"), dtype=torch.float32)
+    plot_params_distribution_single(
+    model=model,
+    pointnet_model=pointnet_model,
+    true_params=true_params,
+    device=device,
+    n_mc=100,
+    compare_with_sbi=True,
+    sbi_posteriors=[samples_snpe, samples_mmd, samples_wass],
+    sbi_labels=["SNPE", "MCABC", "Wasserstein MCABC"]
+    )
+    plot_PDF_distribution_single(model, pointnet_model, true_params, device, n_mc=100)
     plot_event_histogram(model, pointnet_model, true_params, device, n_mc=100, num_events=1000000)
     plot_loss_curves()
     evaluate_over_n_samples(model, pointnet_model, n=100, num_events=100000, device=device)

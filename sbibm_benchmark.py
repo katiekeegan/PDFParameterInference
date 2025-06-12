@@ -1,201 +1,184 @@
-import torch
-from torch.distributions import Uniform
-from sbi.inference import simulate_for_sbi, prepare_for_sbi, SNPE, MCABC
-from sbi.utils.get_nn_models import posterior_nn
+from sbi.inference import simulate_for_sbi, SNPE, MCABC
 from sbi.utils.torchutils import BoxUniform
+import torch
 import numpy as np
 from scipy.stats import wasserstein_distance
 
-import torch
-from torch.distributions import Uniform
-from sbi.inference import simulate_for_sbi, prepare_for_sbi, MCABC
-import numpy as np
-
 ########################
-# PRIOR OVER PARAMETERS
+# SIMULATOR DEFINITIONS
 ########################
-prior = torch.distributions.Independent(
-    Uniform(low=torch.zeros(4), high=5 * torch.ones(4)), 1
-)
-
-########################
-# KERNEL DISTANCE BETWEEN POINT CLOUDS
-########################
-def pairwise_squared_dist(x, y):
-    # x: [N, D], y: [M, D]
-    x2 = x.pow(2).sum(dim=1, keepdim=True)  # [N, 1]
-    y2 = y.pow(2).sum(dim=1, keepdim=True).T  # [1, M]
-    xy = x @ y.T  # [N, M]
-    return x2 - 2 * xy + y2  # [N, M]
-
-def kernel(x, y, sigma=1.0):
-    dists = pairwise_squared_dist(x, y)
-    return torch.exp(-dists / (2 * sigma**2))
-
-def kernel_mean_embedding(x, y, sigma=1.0):
-    kxx = kernel(x, x, sigma).mean()
-    kyy = kernel(y, y, sigma).mean()
-    kxy = kernel(x, y, sigma).mean()
-    return kxx + kyy - 2 * kxy
-
-def custom_distance(x1, x2):
-    return kernel_mean_embedding(x1, x2, sigma=1.0)
 @torch.no_grad()
 def simulator(theta):
-    """
-    theta: shape [4] (single parameter sample)
-    returns: point cloud of shape [N_events, 6]
-    """
-    # Replace this with your actual DIS simulation logic
-    # For now, we'll mock something realistic
     N = 100000
 
-    def up(self, x):
-        return self.Nu * (x ** self.au) * ((1 - x) ** self.bu)
+    def up(x, theta):
+        return 1 * (x ** theta[0]) * ((1 - x) ** theta[1])
 
-    def down(self, x):
-        return self.Nd * (x ** self.ad) * ((1 - x) ** self.bd)
+    def down(x, theta):
+        return 2 * (x ** theta[2]) * ((1 - x) ** theta[3])
 
-    xs_p = torch.rand(N, device=self.device)
-    sigma_p = 4 * up(xs_p) + down(xs_p)
+    xs_p = torch.rand(N)
+    sigma_p = 4 * up(xs_p, theta) + down(xs_p, theta)
     sigma_p = torch.nan_to_num(sigma_p, nan=0.0)
 
-    xs_n = torch.rand(N, device=self.device)
-    sigma_n = 4 * down(xs_n) + up(xs_n)
+    xs_n = torch.rand(N)
+    sigma_n = 4 * down(xs_n, theta) + up(xs_n, theta)
     sigma_n = torch.nan_to_num(sigma_n, nan=0.0)
 
     x = torch.cat([sigma_p.unsqueeze(0), sigma_n.unsqueeze(0)], dim=0).t()
-    # x = torch.randn(N, 6) + theta[None, 0].item()  # use θ₁ as offset
     return x.float()
 
 def simulator_batch(theta_batch):
+    return [simulator(theta) for theta in theta_batch]
+
+def simulator_batch_summary(theta_batch):
     """
-    theta_batch: shape [B, 4]
-    returns: list of [N_events, 6] tensors, each as an observation
+    Returns [B, summary_dim] where each row is a feature vector (summary)
     """
-    return [simulator(theta[i]) for i in range(theta_batch.shape[0])]
-
-########################
-# SBI PIPELINE
-########################
-if __name__ == "__main__":
-    # Wrap simulator + prepare prior
-    def wrapped_simulator(theta_batch):
-        # return a list of tensors, which simulate_for_sbi will accept
-        return simulator_batch(theta_batch)
-
-    wrapped_simulator, wrapped_prior = prepare_for_sbi(wrapped_simulator, prior)
-
-    # Simulate training data
-    num_simulations = 500  # Keep this manageable
-    theta, x = simulate_for_sbi(wrapped_simulator, wrapped_prior, num_simulations=num_simulations)
-
-    # Define inference method with custom distance
-    inference = MCABC(prior=wrapped_prior, simulator=wrapped_simulator, distance=custom_distance)
-
-    # True parameter and observed data
-    true_theta = torch.tensor([1.0, 2.0, 0.5, 4.0])
-    x_o = simulator(true_theta)
-
-    # Run inference
-    posterior = inference(x_o)
-
-    # Sample from posterior
-    samples = posterior.sample((1000,))
-    print("Posterior mean:", samples.mean(dim=0))
-    print("Posterior std:", samples.std(dim=0))
+    return torch.stack([histogram_summary(simulator(theta)) for theta in theta_batch])
 
 def histogram_summary(x, nbins=32, range_min=-10, range_max=10):
-    """
-    Convert point cloud [N, D] to a fixed-size vector [D * nbins].
-    - Bins are the same for every x.
-    - Histogram is normalized per feature.
-    """
     D = x.shape[1]
     summaries = []
-
     for d in range(D):
-        # Use torch.histc for fast binning
         hist = torch.histc(x[:, d], bins=nbins, min=range_min, max=range_max)
-        hist = hist / (hist.sum() + 1e-8)  # normalize to sum to 1
+        hist = hist / (hist.sum() + 1e-8)
         summaries.append(hist)
+    return torch.cat(summaries, dim=0)
 
-    return torch.cat(summaries, dim=0)  # shape: [D * nbins]
-
-def snpe_benchmark(simulator, prior, nbins=32):
-    def sim_fn(theta):
-        return histogram_summary(simulator(theta), nbins=nbins)
-
-    # Wrap simulator and prior
-    sim_fn_wrapped, prior_wrapped = prepare_for_sbi(sim_fn, prior)
-
-    # Simulate training data
-    theta, x = simulate_for_sbi(sim_fn_wrapped, prior_wrapped, num_simulations=1000)
-
-    # Inference
-    inference = SNPE(prior_wrapped)
+def snpe_benchmark(simulator, param_prior, nbins=32):
+    def sim_fn(theta_batch):
+        return simulator_batch_summary(theta_batch)
+    theta, x = simulate_for_sbi(sim_fn, param_prior, num_simulations=10000)
+    inference = SNPE(param_prior)
     density_estimator = inference.append_simulations(theta, x).train()
-    posterior = inference.build_posterior(density_estimator)
+    return inference.build_posterior(density_estimator)
 
-    return posterior
+def wasserstein_abc_benchmark(simulator, param_prior):
+    inference = MCABC(prior=param_prior, simulator=simulator_batch, distance=wasserstein_distance_wrapper)
+    true_theta = torch.tensor([1.0, 2.0, 0.5, 1.0])
+    x_o = simulator(true_theta)
+    return inference(x_o, num_simulations=10000, quantile=0.01)
+
+########################
+# KERNEL DISTANCE
+########################
+def pairwise_squared_dist(x, y):
+    x2 = x.pow(2).sum(dim=1, keepdim=True)
+    y2 = y.pow(2).sum(dim=1, keepdim=True).T
+    xy = x @ y.T
+    return x2 - 2 * xy + y2
+
+def kernel(x, y, sigma=1.0):
+    return torch.exp(-pairwise_squared_dist(x, y) / (2 * sigma**2))
+
+def kernel_mean_embedding(x, y, sigma=1.0):
+    return kernel(x, x, sigma).mean() + kernel(y, y, sigma).mean() - 2 * kernel(x, y, sigma).mean()
+
+def custom_distance(x1, x2):
+    if x1.ndim == 1:
+        x1 = x1.unsqueeze(0)
+    if x2.ndim == 1:
+        x2 = x2.unsqueeze(0)
+    raw = kernel_mean_embedding(x1, x2, sigma=1.0)
+    return (raw / (1.0 + raw)).item()  # return a Python float
 
 def sliced_wasserstein(x1, x2, num_projections=50):
-    """
-    x1, x2: [N, D]
-    Returns: average 1D Wasserstein distance
-    """
+    if x1.ndim == 1:
+        x1 = x1.unsqueeze(0)  # [1, D]
+    if x2.ndim == 1:
+        x2 = x2.unsqueeze(0)  # [1, D]
+
     d = x1.shape[1]
     distances = []
     for _ in range(num_projections):
-        proj = torch.randn(d)
+        proj = torch.randn(d, device=x1.device)
         proj = proj / torch.norm(proj)
-        x1_proj = x1 @ proj
-        x2_proj = x2 @ proj
-        w = wasserstein_distance(x1_proj.cpu().numpy(), x2_proj.cpu().numpy())
-        distances.append(w)
-    return np.mean(distances)
+
+        x1_proj = (x1 @ proj).view(-1).cpu().numpy()  # always 1D
+        x2_proj = (x2 @ proj).view(-1).cpu().numpy()
+
+        if len(x1_proj) == 0 or len(x2_proj) == 0:
+            distances.append(np.nan)
+        else:
+            w = wasserstein_distance(x1_proj, x2_proj)
+            distances.append(w)
+
+    return np.nanmean(distances)
+
+def wasserstein_distance_vectorized(x1, x_batch):
+    """
+    x1: [N1, D] sample from the observation
+    x_batch: [B, N2, D] batch of simulated samples
+    returns: torch.tensor of shape [B] with scalar distances
+    """
+    distances = []
+    for x2 in x_batch:
+        dist = sliced_wasserstein(x1, x2)  # returns scalar
+        distances.append(dist)
+    return torch.tensor(distances)
+
+def custom_distance_vectorized(x1, x_batch):
+    """
+    x1: [D] summary vector of observation (unbatched)
+    x_batch: [B, D] batch of simulated summaries
+    returns: torch.tensor of shape [B] with scalar distances
+    """
+    if x1.ndim == 1:
+        x1 = x1.unsqueeze(0)  # [1, D]
+
+    distances = []
+    for x2 in x_batch:
+        distances.append(custom_distance(x1.squeeze(0), x2))  # still returns float
+
+    return torch.tensor(distances)  # [B]
 
 def wasserstein_distance_wrapper(x1, x2):
     return sliced_wasserstein(x1, x2)
 
-def wasserstein_abc_benchmark(simulator, prior):
-    # Wrap for sbi
-    def sim_fn_batch(theta_batch):
-        return [simulator(theta) for theta in theta_batch]
-
-    sim_fn_wrapped, prior_wrapped = prepare_for_sbi(sim_fn_batch, prior)
-
-    inference = MCABC(prior=prior_wrapped, simulator=sim_fn_wrapped, distance=wasserstein_distance_wrapper)
-
-    true_theta = torch.tensor([1.0, 2.0, 0.5, 4.0])
-    x_o = simulator(true_theta)
-
-    posterior = inference(x_o)
-    return posterior
-
 if __name__ == "__main__":
-    # Define prior
-    prior = BoxUniform(low=torch.zeros(4), high=5 * torch.ones(4))
+    # Avoid any previous name conflicts: define a clean variable
+    prior_dist = BoxUniform(low=torch.zeros(4), high=5 * torch.ones(4))
 
-    # Define true observation
-    true_theta = torch.tensor([1.0, 2.0, 0.5, 4.0])
+    # True observation
+    true_theta = torch.tensor([1.0, 0.5, 1.2, 0.5])
     x_o = simulator(true_theta)
-
-    ### 1. MCABC with kernel
+    x_o_summary = histogram_summary(x_o)
+    # Try this after simulation
+    samples = simulator_batch_summary(prior_dist.sample((100,)))
+    dists = [custom_distance(x_o_summary, s) for s in samples]
+    print("Example distances:", dists[:10])
+    print("Mean distance:", torch.tensor(dists).mean())
+    print("Example distances:", dists[:10])
+    print("Mean distance:", torch.tensor(dists).mean())
+    ### 1. MCABC (MMD)
     print("Running MCABC (kernel MMD)...")
-    posterior_mmd = MCABC(prior, simulator, distance=custom_distance)(x_o)
-    samples_mmd = posterior_mmd.sample((1000,))
-    print("MMD Posterior mean:", samples_mmd.mean(0))
+    samples_mmd = MCABC(
+        prior=prior_dist,
+        simulator=simulator_batch_summary,
+        distance=custom_distance_vectorized  # should now accept summary vectors
+    )(x_o_summary, num_simulations=10000, quantile=0.01)
+    # samples_mmd = posterior_mmd#.sample((1000,))
+    # Convert to numpy and save
+    np.savetxt("samples_mmd.txt", samples_mmd.cpu().numpy())
+    print("MMD Posterior median:", samples_mmd.median(0))
 
-    ### 2. SNPE (histograms)
+    ### 2. SNPE
     print("Running SNPE (histograms)...")
-    posterior_snpe = snpe_benchmark(simulator, prior)
+    posterior_snpe = snpe_benchmark(simulator, prior_dist)
     x_o_hist = histogram_summary(x_o)
-    samples_snpe = posterior_snpe.sample((1000,), x=x_o_hist)
+    samples_snpe = posterior_snpe.sample((100,), x=x_o_hist)
     print("SNPE Posterior mean:", samples_snpe.mean(0))
-
+    np.savetxt("samples_snpe.txt", samples_snpe.cpu().numpy())
     ### 3. Wasserstein ABC
     print("Running Wasserstein ABC...")
-    posterior_wasserstein = wasserstein_abc_benchmark(simulator, prior)
-    samples_wass = posterior_wasserstein.sample((1000,))
+    # posterior_wasserstein = wasserstein_abc_benchmark(simulator_batch_summary, prior_dist)
+    # samples_wass = posterior_wasserstein.sample((100,))
+    samples_wass = MCABC(
+        prior=prior_dist,
+        simulator=simulator_batch_summary,
+        distance=wasserstein_distance_vectorized  # should now accept summary vectors
+    )(x_o_summary, num_simulations=10000, quantile=0.01)
+    # samples_mmd = posterior_mmd#.sample((1000,))
     print("Wasserstein Posterior mean:", samples_wass.mean(0))
+    np.savetxt("samples_wasserstein.txt", samples_wass.cpu().numpy())
