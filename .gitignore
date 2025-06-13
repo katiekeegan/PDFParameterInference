@@ -23,6 +23,12 @@ Pipfile.lock
 *.pth
 *.pt
 *.ckpt
+*.h5
+*.txt
+*.npy
+*.sh
+*.json
+*.yaml
 
 # Ignore images
 *.png
