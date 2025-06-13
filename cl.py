@@ -13,6 +13,57 @@ import wandb
 
 from models import PointNetPMA
 
+class RealisticDISSimulator:
+    def __init__(self, device=None, smear=True, smear_std=0.05):
+        self.device = device or torch.device("cpu")
+        self.smear = smear
+        self.smear_std = smear_std
+        self.Q0_squared = 1.0  # GeV^2 reference scale
+        self.params = None
+
+    def __call__(self, params, nevents=1000):
+        return self.sample(params, nevents)
+
+    def init(self, params):
+        # Accepts raw list or tensor of 6 params: [logA0, delta, a, b, c, d]
+        p = torch.tensor(params, dtype=torch.float32, device=self.device)
+        self.logA0 = p[0]
+        self.delta = p[1]
+        self.a = p[2]
+        self.b = p[3]
+        self.c = p[4]
+        self.d = p[5]
+
+    def q(self, x, Q2):
+        A0 = torch.exp(self.logA0)
+        scale_factor = (Q2 / self.Q0_squared).clamp(min=1e-6)
+        A_Q2 = A0 * scale_factor ** self.delta
+        shape = x.clamp(min=1e-6, max=1.0)**self.a * (1 - x.clamp(min=0.0, max=1.0))**self.b
+        poly = 1 + self.c * x + self.d * x**2
+        shape = shape * poly.clamp(min=1e-6)  # avoid negative polynomial tail
+        return A_Q2 * shape
+
+    def F2(self, x, Q2):
+        return x * self.q(x, Q2)
+
+    def sample(self, params, nevents=1000, x_range=(1e-3, 0.9), Q2_range=(1.0, 1000.0)):
+        self.init(params)
+
+        # Sample x ~ Uniform, Q2 ~ LogUniform
+        x = torch.rand(nevents, device=self.device) * (x_range[1] - x_range[0]) + x_range[0]
+        logQ2 = torch.rand(nevents, device=self.device) * (
+            np.log10(Q2_range[1]) - np.log10(Q2_range[0])
+        ) + np.log10(Q2_range[0])
+        Q2 = 10 ** logQ2
+
+        f2 = self.F2(x, Q2)
+
+        if self.smear:
+            noise = torch.randn_like(f2) * (self.smear_std * f2)
+            f2 = f2 + noise
+            f2f = f2.clamp(min=1e-6)
+
+        return torch.stack([x, Q2, f2], dim=1)  # shape: [nevents, 3]
 
 class NTXentThetaContrastiveLoss(nn.Module):
     def __init__(self, temperature=0.1, sim_threshold=0.15, dissim_threshold=0.35, clip_logits=30.0):
@@ -100,6 +151,57 @@ class DISDataset(IterableDataset):
 
             yield theta.cpu(), torch.stack(xs)  # [n_repeat, num_points, feature_dim]
 
+class RealisticDISDataset(IterableDataset):
+    def __init__(
+        self,
+        simulator,
+        num_samples,
+        num_events,
+        rank,
+        world_size,
+        theta_dim=6,        # logA0, delta, a, b, c, d
+        theta_bounds=None,  # custom bounds (optional)
+        n_repeat=2,
+        feature_engineering=None,
+    ):
+        self.simulator = simulator
+        self.num_samples = num_samples // world_size
+        self.num_events = num_events
+        self.rank = rank
+        self.world_size = world_size
+        self.theta_dim = theta_dim
+        self.n_repeat = n_repeat
+
+        if theta_bounds is None:
+            # Default bounds per parameter: adjust based on physical priors
+            self.theta_bounds = torch.tensor([
+                [-2.0, 2.0],   # logA0
+                [-1.0, 1.0],   # delta
+                [0.0, 5.0],    # a
+                [0.0, 10.0],   # b
+                [-5.0, 5.0],   # c
+                [-5.0, 5.0],   # d
+            ])
+        else:
+            self.theta_bounds = torch.tensor(theta_bounds)
+
+        self.feature_engineering = feature_engineering# or (lambda x: x)
+
+    def __iter__(self):
+        device = torch.device(f"cuda:{self.rank}" if torch.cuda.is_available() else "cpu")
+        self.simulator.device = device
+        theta_bounds = self.theta_bounds.to(device)
+
+        for _ in range(self.num_samples):
+            theta = torch.rand(self.theta_dim, device=device)
+            theta = theta * (theta_bounds[:, 1] - theta_bounds[:, 0]) + theta_bounds[:, 0]
+
+            xs = []
+            for _ in range(self.n_repeat):
+                x = self.simulator.sample(theta, self.num_events)  # shape: [num_events, 3]
+                xs.append(self.feature_engineering(x).cpu())       # e.g., log(x), normalize, etc.
+
+            yield theta.cpu(), torch.stack(xs)  # shape: [n_repeat, num_events, feature_dim]
 
 def feature_engineering(x):
     x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
@@ -256,14 +358,18 @@ def cleanup():
 def main_worker(rank, world_size, args):
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
-    simulator = SimplifiedDIS(device=device)
-    dummy_theta = torch.rand(4, device=device)
+    if args.problem == 'simplified_dis':
+        simulator = SimplifiedDIS(device=device)
+        dataset = DISDataset(simulator, args.num_samples, args.num_events, rank, world_size)
+        input_dim = 4
+    elif args.problem == 'realistic_dis':
+        simulator = RealisticDISSimulator(device=device, smear=True, smear_std=0.05)
+        dataset = RealisticDISDataset(simulator, args.num_samples, args.num_events, rank, world_size, feature_engineering=feature_engineering)
+        input_dim = 6
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, num_workers=4, pin_memory=True)
+    dummy_theta = torch.rand(input_dim, device=device)
     dummy_x = simulator.sample(dummy_theta, args.num_events)
     input_dim = feature_engineering(dummy_x).shape[-1]
-
-    dataset = DISDataset(simulator, args.num_samples, args.num_events, rank, world_size)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, num_workers=4, pin_memory=True)
-
     model = PointNetPMA(input_dim=input_dim, latent_dim=args.latent_dim, predict_theta=True).to(device)
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model = DDP(model, device_ids=[rank])
@@ -283,6 +389,7 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--latent_dim', type=int, default=256)
+    parser.add_argument('--problem', type=str, default='simplified_dis')
     parser.add_argument('--wandb', action='store_true')
     args = parser.parse_args()
 
