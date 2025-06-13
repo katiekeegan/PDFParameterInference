@@ -30,3 +30,39 @@ Pipfile.lock
 *.jpeg
 
 # Ignore Jupyter
+
+.ipynb_checkpoints/
+# Ignore logs
+logs/
+# Ignore temporary files
+*.tmp
+# Ignore data files
+data/
+# Ignore configuration files
+config.yaml
+# Ignore documentation files
+docs/
+# Ignore test files
+tests/
+# Ignore coverage reports
+coverage.xml
+# Ignore build directories
+build/
+# Ignore distribution files
+dist/
+# Ignore cache directories
+.cache/
+# Ignore environment files
+.env.local
+# Ignore backup files
+*.bak
+# Ignore system files
+.DS_Store
+# Ignore Python egg files
+*.egg
+# Ignore Python wheel files
+*.whl
+# Ignore coverage reports
+coverage/
+# Ignore wandb
+wandb/
