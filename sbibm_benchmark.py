@@ -174,9 +174,8 @@ if __name__ == "__main__":
     print("Example distances:", dists[:10])
     print("Mean distance:", torch.tensor(dists).mean()) 
 
-    ### 1. MCABC (MMD) 
-    # Kernel MMD is used to get a distance between the true parameters and the simulated parameters
-    
+    ### 1. MCABC (L2) 
+
     print("Running MCABC (L2 Distance)...")
     samples_mmd = MCABC(
         prior=prior_dist,
@@ -194,7 +193,7 @@ if __name__ == "__main__":
     samples_snpe = posterior_snpe.sample((100,), x=x_o_hist)
     print("SNPE Posterior mean:", samples_snpe.mean(0))
     np.savetxt("samples_snpe.txt", samples_snpe.cpu().numpy())
-    
+
     ### 3. Wasserstein ABC
     print("Running MCABC (Wasserstein Distance)...")
     samples_wass = MCABC(
