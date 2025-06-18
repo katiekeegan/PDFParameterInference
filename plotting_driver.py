@@ -324,6 +324,51 @@ def plot_params_distribution_single(
     plt.savefig(save_path)
     plt.show()
 
+def plot_sbi_posteriors_only(
+    true_params,
+    sbi_posteriors,   # list of tensors
+    sbi_labels=None,  # list of strings
+    save_path="SBI_Dist.png"
+):
+    n_params = true_params.size(0)
+    fig, axes = plt.subplots(1, n_params, figsize=(4 * n_params, 4))
+
+    if n_params == 1:
+        axes = [axes]
+
+    colors = ['orange', 'green', 'purple', 'gray', 'cyan']
+
+    # Compute global x-limits across all posteriors
+    all_samples = [s.cpu() for s in sbi_posteriors]
+    
+    for i in range(n_params):
+        param_vals = [s[:, i].numpy() for s in all_samples]
+        xmin = min([v.min() for v in param_vals])
+        xmax = max([v.max() for v in param_vals])
+        padding = 0.05 * (xmax - xmin)
+        xmin -= padding
+        xmax += padding
+
+        for j, sbi_samples in enumerate(all_samples):
+            label = sbi_labels[j] if sbi_labels and j < len(sbi_labels) else f"SBI {j}"
+            axes[i].hist(
+                sbi_samples[:, i].numpy(),
+                bins=20,
+                alpha=0.6,
+                density=True,
+                color=colors[j % len(colors)],
+                label=label
+            )
+
+        axes[i].axvline(true_params[i].item(), color='red', linestyle='dashed', label='True Value')
+        axes[i].set_xlim(xmin, xmax)
+        axes[i].set_title(f'Param {i+1}')
+        axes[i].legend()
+
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.show()
+
 def plot_PDF_distribution_single(model, pointnet_model, true_params, device, n_mc=100):
     """
     Plot the PDF distribution of the model's predictions compared to the true parameters.
@@ -520,33 +565,61 @@ def main():
     model_path = 'final_inference_net.pth'  # Path to the trained model
     pointnet_model_path = 'final_model.pth'  # Path to the pretrained PointNet model
     # TODO: add RealisticDIS support
-    n_mc=100
-    # Load the model and data
-    model, pointnet_model, dataloader, device = load_model_and_data(model_path, pointnet_model_path)
-    true_params = torch.tensor([1.0, 0.5, 1.2, 0.5])
-    # plot_params_distribution_single(model, pointnet_model, true_params, device, n_mc=100)
+    # TODO: make this script more flexible for different runs and model parameters
+    
+    n_mc=100 # Number of Monte Carlo samples to draw
+    true_params = torch.tensor([1.0, 0.5, 1.2, 0.5]) # NOTE: set this to match whatever you ran sbibm_benchmark.py with
+
+    """
+    IF YOU ONLY CARE ABOUT THE SBI TOOLBOX POSTERIOR PLOTS, YOU JUST NEED THE FOLLOWING LINES AND CAN
+    COMMENT OUT EVERYTHING AFTERWARDS.
+
+    STARTING HERE:
+    """
     # Load approximate posteriors generated with SBI methods
     samples_snpe = torch.tensor(np.loadtxt("samples_snpe.txt"), dtype=torch.float32)
     samples_wass = torch.tensor(np.loadtxt("samples_wasserstein.txt"), dtype=torch.float32)
     samples_mmd = torch.tensor(np.loadtxt("samples_mmd.txt"), dtype=torch.float32)
-    # Plot the results
-    plot_params_distribution_single(
-    model=model,
-    pointnet_model=pointnet_model,
-    true_params=true_params,
-    device=device,
-    n_mc=n_mc,
-    compare_with_sbi=True,
-    sbi_posteriors=[samples_snpe, samples_mmd, samples_wass],
-    sbi_labels=["SNPE", "MCABC", "Wasserstein MCABC"]
+    # Plot the SBI posteriors only
+    plot_sbi_posteriors_only(
+        true_params=true_params,
+        sbi_posteriors=[samples_snpe, samples_mmd, samples_wass],
+        sbi_labels=["SNPE", "MCABC", "Wasserstein MCABC"]
     )
-    # Plot the distribution over PDFs and obtain median PDF
-    plot_PDF_distribution_single(model, pointnet_model, true_params, device, n_mc=n_mc)
-    # Plot the event histograms (cross-sections)
-    plot_event_histogram(model, pointnet_model, true_params, device, n_mc=n_mc, num_events=1000000)
-    # Plot the loss curves
-    plot_loss_curves()
-    # Evaluate the model over n true parameters and compute errors and chi-squared statistics
-    evaluate_over_n_parameters(model, pointnet_model, n=n_mc, num_events=100000, device=device)
+    """
+    ENDING HERE!
+    """
+
+    """
+    If you want to run the full evaluation and plotting, uncomment the following lines.
+    NOTE: you need to have already ran cl.py and PDF_learning.py already.
+    """
+    # # Load the model and data
+    # model, pointnet_model, dataloader, device = load_model_and_data(model_path, pointnet_model_path)
+
+    # # Plot the results
+    # plot_params_distribution_single(
+    #     model=model,
+    #     pointnet_model=pointnet_model,
+    #     true_params=true_params,
+    #     device=device,
+    #     n_mc=n_mc,
+    #     compare_with_sbi=True,
+    #     sbi_posteriors=[samples_snpe, samples_mmd, samples_wass],
+    #     sbi_labels=["SNPE", "MCABC", "Wasserstein MCABC"]
+    # )
+
+    # # Plot the distribution over PDFs and obtain median PDF
+    # plot_PDF_distribution_single(model, pointnet_model, true_params, device, n_mc=n_mc)
+
+    # # Plot the event histograms (cross-sections)
+    # plot_event_histogram(model, pointnet_model, true_params, device, n_mc=n_mc, num_events=1000000)
+
+    # # Plot the loss curves
+    # plot_loss_curves()
+
+    # # Evaluate the model over n true parameters and compute errors and chi-squared statistics
+    # evaluate_over_n_parameters(model, pointnet_model, n=n_mc, num_events=100000, device=device)
+
 if __name__ == "__main__":
     main()
