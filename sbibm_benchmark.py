@@ -138,21 +138,6 @@ def wasserstein_distance_vectorized(x1, x_batch):
         distances.append(dist)
     return torch.tensor(distances)
 
-def custom_distance_vectorized(x1, x_batch):
-    """
-    x1: [D] summary vector of observation (unbatched)
-    x_batch: [B, D] batch of simulated summaries
-    returns: torch.tensor of shape [B] with scalar distances
-    """
-    if x1.ndim == 1:
-        x1 = x1.unsqueeze(0)  # [1, D]
-
-    distances = []
-    for x2 in x_batch:
-        distances.append(custom_distance(x1.squeeze(0), x2))  # still returns float
-
-    return torch.tensor(distances)  # [B]
-
 def wasserstein_distance_wrapper(x1, x2):
     return sliced_wasserstein(x1, x2)
 
@@ -165,7 +150,7 @@ if __name__ == "__main__":
     x_o = simulator(true_theta) # [N, D] tensor of observed data
     x_o_summary = histogram_summary(x_o) # [D * nbins] summary vector
     samples = simulator_batch_summary(prior_dist.sample((100,))) # [B, D * nbins] batch of simulated summaries
-    dists = [custom_distance(x_o_summary, s) for s in samples] # compute distances to each sample
+    dists = [l2_distance_vectorized(x_o_summary, s) for s in samples] # compute distances to each sample
 
     # Sanity Check
     print("Checking to make sure distances are computed correctly...")

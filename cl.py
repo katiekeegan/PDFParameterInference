@@ -63,41 +63,7 @@ class RealisticDISSimulator:
             f2 = f2 + noise
             f2f = f2.clamp(min=1e-6)
 
-        return torch.stack([x, Q2, f2], dim=1)  # shape: [nevents, 3]
-
-class NTXentThetaContrastiveLoss(nn.Module):
-    def __init__(self, temperature=0.1, sim_threshold=0.15, dissim_threshold=0.35, clip_logits=30.0):
-        super().__init__()
-        self.temperature = temperature
-        self.sim_threshold = sim_threshold
-        self.dissim_threshold = dissim_threshold
-        self.clip_logits = clip_logits
-
-    def forward(self, embeddings, thetas):
-        embeddings = F.normalize(embeddings, dim=-1)
-        sim_matrix = torch.matmul(embeddings, embeddings.T) / self.temperature
-        sim_matrix = torch.clamp(sim_matrix, min=-self.clip_logits, max=self.clip_logits)
-
-        theta_dists = torch.cdist(thetas, thetas) / (theta_dists.max() + 1e-8)
-        pos_mask = (theta_dists < self.sim_threshold).float()
-        neg_mask = (theta_dists > self.dissim_threshold).float()
-
-        logits_mask = torch.eye(sim_matrix.size(0), device=sim_matrix.device).bool()
-        sim_matrix = sim_matrix.masked_fill(logits_mask, float("-inf"))
-
-        losses = []
-        for i in range(sim_matrix.size(0)):
-            pos_idx = pos_mask[i].nonzero(as_tuple=True)[0]
-            neg_idx = neg_mask[i].nonzero(as_tuple=True)[0]
-            if len(pos_idx) == 0 or len(neg_idx) == 0:
-                continue
-            selected = torch.cat([pos_idx, neg_idx])
-            logits = sim_matrix[i][selected]
-            labels = torch.zeros(1, dtype=torch.long, device=logits.device)
-            losses.append(F.cross_entropy(logits.unsqueeze(0), labels))
-
-        return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=sim_matrix.device, requires_grad=True)
-
+        return torch.stack([x, Q2, f2], dim=1)  # shape: [nevents, 3]s
 
 class SimplifiedDIS:
     def __init__(self, device=None, smear=False, smear_std=0.05):
@@ -198,25 +164,35 @@ class RealisticDISDataset(IterableDataset):
 
             xs = []
             for _ in range(self.n_repeat):
+                # Sample events from the simulator
                 x = self.simulator.sample(theta, self.num_events)  # shape: [num_events, 3]
                 xs.append(self.feature_engineering(x).cpu())       # e.g., log(x), normalize, etc.
 
             yield theta.cpu(), torch.stack(xs)  # shape: [n_repeat, num_events, feature_dim]
 
-def feature_engineering(x):
-    x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
-    log_features = torch.log1p(x)
-    symlog = torch.sign(x) * torch.log1p(x.abs())
+# Feature Engineering with improved stability
+def feature_engineering(xs_tensor):
+    # Basic features with clamping for numerical stability
+    xs_clamped = torch.clamp(xs_tensor, min=1e-8, max=1e8)
+    del xs_tensor
+    log_features = torch.log1p(xs_clamped)
+    symlog_features = torch.sign(xs_clamped) * torch.log1p(xs_clamped.abs())
 
-    ratios, diffs = [], []
-    for i in range(x.shape[-1]):
-        for j in range(i + 1, x.shape[-1]):
-            ratio = torch.log1p((x[..., i] / (x[..., j] + 1e-8)).abs())
-            diff = torch.log1p(x[..., i]) - torch.log1p(x[..., j])
-            ratios.append(ratio.unsqueeze(-1))
-            diffs.append(diff.unsqueeze(-1))
-
-    return torch.cat([log_features, symlog] + ratios + diffs, dim=-1)
+    # Pairwise features with vectorized operations
+    n_features = xs_clamped.shape[-1]
+    # del xs_tensor
+    combinations = torch.combinations(torch.arange(n_features), r=2)
+    i, j = combinations[:, 0], combinations[:, 1]
+    del combinations
+    # Safe division with clamping
+    ratio = xs_clamped[..., i] / (xs_clamped[..., j] + 1e-8)
+    ratio_features = torch.log1p(ratio.abs())
+    del ratio
+    
+    diff_features = torch.log1p(xs_clamped[..., i]) - torch.log1p(xs_clamped[..., j])
+    del xs_clamped
+    data = torch.cat([log_features, symlog_features, ratio_features, diff_features], dim=-1)
+    return data
 
 def contrastive_loss_fn(z, theta, temperature=0.1, sim_threshold=0.15, dissim_threshold=0.35, margin=1.0, scale=2.0):
     # Normalize latent set-level embeddings
@@ -290,7 +266,6 @@ def triplet_theta_contrastive_loss(z, theta, margin=0.5, sim_threshold=0.05, dis
             margin=margin,
             reduction='none'
         )
-
         losses.append(triplet_loss)
 
     if len(losses) == 0:
@@ -364,11 +339,15 @@ def main_worker(rank, world_size, args):
         input_dim = 4
     elif args.problem == 'realistic_dis':
         simulator = RealisticDISSimulator(device=device, smear=True, smear_std=0.05)
+        print("Simulator constructed!")
         dataset = RealisticDISDataset(simulator, args.num_samples, args.num_events, rank, world_size, feature_engineering=feature_engineering)
+        print("Dataset created!")
         input_dim = 6
     dataloader = DataLoader(dataset, batch_size=args.batch_size, num_workers=4, pin_memory=True)
     dummy_theta = torch.rand(input_dim, device=device)
     dummy_x = simulator.sample(dummy_theta, args.num_events)
+    print(f"dummy_theta: {dummy_theta}")
+    print(f"dummy_x: {dummy_x}")
     input_dim = feature_engineering(dummy_x).shape[-1]
     model = PointNetPMA(input_dim=input_dim, latent_dim=args.latent_dim, predict_theta=True).to(device)
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)

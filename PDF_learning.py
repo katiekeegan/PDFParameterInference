@@ -41,44 +41,6 @@ def precompute_features_and_latents_to_disk(pointnet_model, xs_tensor, thetas, o
 
             del xs_chunk, xs_engineered, latent
             torch.cuda.empty_cache()
-class GenerativeInferenceNet(nn.Module):
-    def __init__(self, latent_dim, param_dim=4, hidden_dim=512):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(latent_dim + param_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, param_dim * 2)  # μ and logσ²
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim + param_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, param_dim)
-        )
-        self.param_dim=param_dim
-
-    def forward(self, z, theta=None):
-        # During training, θ is known
-        q_input = torch.cat([z, theta], dim=-1)
-        # print(f'theta {theta.size()}')
-        # print(f'z {z.size()}')
-        q_stats = self.encoder(q_input)
-        mu, log_var = torch.chunk(q_stats, 2, dim=-1)
-        std = torch.exp(0.5 * log_var)
-        eps = torch.randn_like(std)
-        theta_sample = mu + eps * std
-
-        # Decode: p(θ | z)
-        dec_input = torch.cat([z, theta_sample], dim=-1)
-        recon_theta = self.decoder(dec_input)
-        return recon_theta, mu, log_var
-    
-
-    def infer_from_latent(self, z):
-        # Sample θ from standard Gaussian prior
-        theta_prior = torch.randn(z.shape[0], self.param_dim, device=z.device)
-        return self.forward(z, theta=theta_prior)
 
 # Suppress numerical warnings
 warnings.filterwarnings('ignore', category=RuntimeWarning)
@@ -137,7 +99,7 @@ class H5Dataset(Dataset):
 
 
 class InferenceNet(nn.Module):
-    def __init__(self, embedding_dim, hidden_dim=512):
+    def __init__(self, embedding_dim, ouput_dim = 4, hidden_dim=512):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(embedding_dim, hidden_dim),
@@ -151,7 +113,7 @@ class InferenceNet(nn.Module):
             nn.Dropout(0.5),
             nn.Linear(hidden_dim, hidden_dim//2),
             nn.ReLU(),
-            nn.Linear(hidden_dim//2, 4)  # Output raw (unconstrained) parameters
+            nn.Linear(hidden_dim//2, output_dim)  # Output raw (unconstrained) parameters
         )
         self._init_weights()
         
@@ -213,6 +175,58 @@ def advanced_feature_engineering(xs_tensor):
     del xs_clamped
     data = torch.cat([log_features, symlog_features, ratio_features, diff_features], dim=-1)
     return data
+
+class RealisticDISSimulator:
+    def __init__(self, device=None, smear=True, smear_std=0.05):
+        self.device = device or torch.device("cpu")
+        self.smear = smear
+        self.smear_std = smear_std
+        self.Q0_squared = 1.0  # GeV^2 reference scale
+        self.params = None
+
+    def __call__(self, params, nevents=1000):
+        return self.sample(params, nevents)
+
+    def init(self, params):
+        # Accepts raw list or tensor of 6 params: [logA0, delta, a, b, c, d]
+        p = torch.tensor(params, dtype=torch.float32, device=self.device)
+        self.logA0 = p[0]
+        self.delta = p[1]
+        self.a = p[2]
+        self.b = p[3]
+        self.c = p[4]
+        self.d = p[5]
+
+    def q(self, x, Q2):
+        A0 = torch.exp(self.logA0)
+        scale_factor = (Q2 / self.Q0_squared).clamp(min=1e-6)
+        A_Q2 = A0 * scale_factor ** self.delta
+        shape = x.clamp(min=1e-6, max=1.0)**self.a * (1 - x.clamp(min=0.0, max=1.0))**self.b
+        poly = 1 + self.c * x + self.d * x**2
+        shape = shape * poly.clamp(min=1e-6)  # avoid negative polynomial tail
+        return A_Q2 * shape
+
+    def F2(self, x, Q2):
+        return x * self.q(x, Q2)
+
+    def sample(self, params, nevents=1000, x_range=(1e-3, 0.9), Q2_range=(1.0, 1000.0)):
+        self.init(params)
+
+        # Sample x ~ Uniform, Q2 ~ LogUniform
+        x = torch.rand(nevents, device=self.device) * (x_range[1] - x_range[0]) + x_range[0]
+        logQ2 = torch.rand(nevents, device=self.device) * (
+            np.log10(Q2_range[1]) - np.log10(Q2_range[0])
+        ) + np.log10(Q2_range[0])
+        Q2 = 10 ** logQ2
+
+        f2 = self.F2(x, Q2)
+
+        if self.smear:
+            noise = torch.randn_like(f2) * (self.smear_std * f2)
+            f2 = f2 + noise
+            f2f = f2.clamp(min=1e-6)
+
+        return torch.stack([x, Q2, f2], dim=1)  # shape: [nevents, 3]s
 
 # SimplifiedDIS class with improved numerical stability
 class SimplifiedDIS:
@@ -278,25 +292,22 @@ class SimplifiedDIS:
         return self.Nd * (x_clamped ** self.ad.unsqueeze(1)) * ((1 - x_clamped) ** self.bd.unsqueeze(1))
 
 # Data Generation with improved stability
-def generate_data(num_samples, num_events, theta_dim=4, x_dim=2, device=torch.device("cpu")):
-    simulator = SimplifiedDIS(device)
-    # ranges = [(-0.5, 10), (0.1, 10), (0.1, 10), (0.1, 10)]  # Avoid zero values
-    # theta_bounds = torch.tensor([
-    #             [0.1, 5],
-    #             [-1, -0.1],
-    #             [0.1, 5],
-    #             [-1, -0.1],
-    #         ], device=device)
-
-    # # Sample uniform values in [0, 1] for each dimension
-    # theta = torch.rand(theta_dim, device=device)
-                # [0.1, 5],
-                # [-1, -0.5],
-                # [0.1, 5],
-                # [-1, -0.5],
-    # # Scale to the desired ranges
-    # theta = theta * (theta_bounds[:, 1] - theta_bounds[:, 0]) + theta_bounds[:, 0]
-    ranges = [(0.0, 5), (0.0, 5), (0.0, 5), (0.0, 5)]  # Example ranges
+def generate_data(num_samples, num_events, problem, theta_dim=4, x_dim=2, device=torch.device("cpu")):
+    if problem == 'simplified_dis':
+        simulator = SimplifiedDIS(device)
+        theta_dim = 4 # [au, bu, ad, bd]
+        ranges = [(0.0, 5), (0.0, 5), (0.0, 5), (0.0, 5)]  # Example ranges
+    elif problem == 'realistic_dis':
+        simulator = RealisticDISSimulator(device)
+        theta_dim = 6
+        ranges = [
+                (-2.0, 2.0),   # logA0
+                (-1.0, 1.0),   # delta
+                (0.0, 5.0),    # a
+                (0.0, 10.0),   # b
+                (-5.0, 5.0),   # c
+                (-5.0, 5.0),   # d
+        ]
     thetas = np.column_stack([np.random.uniform(low, high, size=num_samples) for low, high in ranges])
     xs = np.array([simulator.sample(theta, num_events).cpu().numpy() for theta in thetas]) + 1e-8
     thetas_tensor = torch.tensor(thetas, dtype=torch.float32, device=device)
@@ -506,6 +517,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=10000)
     parser.add_argument('--gpus', type=int, default=torch.cuda.device_count())
     parser.add_argument('--nodes', type=int, default=1)  # For multi-node support
+    parser.add_argument('--problem', type=str, default='simplified_dis', choices=['simplified_dis', 'realistic_dis'])
     args = parser.parse_args()
     
     # Common setup for both single and multi-GPU
@@ -515,7 +527,7 @@ def main():
     # Sample and prepare data (do this once, not in both branches)
     num_samples = 2000
     num_events = 1000000
-    thetas, xs = generate_data(num_samples, num_events, device=device)
+    thetas, xs = generate_data(num_samples, num_events, problem=args.problem, device=device)
     input_dim = 6
     pointnet_model = PointNetPMA(input_dim=input_dim, latent_dim=latent_dim, predict_theta=True)
     # pointnet_model.load_state_dict(torch.load('pointnet_embedding_latent_dim_1024.pth', map_location='cpu'))
@@ -570,7 +582,7 @@ def main():
         dataloader = DataLoader(dataset, batch_size=32, shuffle=True, 
                                 collate_fn=EventDataset.collate_fn, num_workers=0, pin_memory=True, persistent_workers=False)
         
-        inference_net = InferenceNet(embedding_dim=latent_dim).to(device)
+        inference_net = InferenceNet(embedding_dim=latent_dim, output_dim=thetas.size(-1)).to(device)
         optimizer = get_optimizer(inference_net, lr=1e-4)
         # scheduler = get_scheduler(optimizer, epochs=args.epochs)
         scaler = amp.GradScaler()
