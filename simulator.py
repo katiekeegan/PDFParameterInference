@@ -3,20 +3,8 @@ from torch.distributions import Uniform, Distribution
 import numpy as np
 
 class SimplifiedDIS:
-    def __init__(self, device):
-        self.Nu = 1
-        self.au = 1 # params[0]
-        self.bu = 1 # params[1]
-        self.Nd = 2
-        self.ad = 1 # params[2]
-        self.bd = 1 # params[3]
-        self.device = None
-    def __call__(
-        self,
-        depth_profiles: np.ndarray,
-    ):
-        """Call to simulator."""
-        return self.sample(depth_profiles)
+    def __init__(self, device=None):
+        self.device = device
 
     def init(self, params):
         self.Nu = 1
@@ -25,28 +13,49 @@ class SimplifiedDIS:
         self.Nd = 2
         self.ad = params[2]
         self.bd = params[3]
-    
-    def up(self, x):
-        u = self.Nu * (x ** self.au) * ((1 - x) ** self.bu)
-        return u
-    
-    def down(self, x):
-        d = self.Nd * (x ** self.ad) * ((1 - x) ** self.bd)
-        return d
-    
-    def sample(self, params, nevents=1):
-        self.init(torch.tensor(params))
 
-        xs_p = torch.rand(nevents)
+    def up(self, x):
+        return self.Nu * (x ** self.au) * ((1 - x) ** self.bu)
+
+    def down(self, x):
+        return self.Nd * (x ** self.ad) * ((1 - x) ** self.bd)
+
+    def sample(self, params, nevents=1):
+        self.init(torch.tensor(params, device=self.device))
+
+        xs_p = torch.rand(nevents, device=self.device)
         sigma_p = 4 * self.up(xs_p) + self.down(xs_p)
-        sigma_p = torch.nan_to_num(sigma_p, nan=0.0)  # Replace NaNs with 0
-        
-        xs_n = torch.rand(nevents)
+        sigma_p = torch.nan_to_num(sigma_p, nan=0.0)
+
+        xs_n = torch.rand(nevents, device=self.device)
         sigma_n = 4 * self.down(xs_n) + self.up(xs_n)
         sigma_n = torch.nan_to_num(sigma_n, nan=0.0)
-        
+
         return torch.cat([sigma_p.unsqueeze(0), sigma_n.unsqueeze(0)], dim=0).t()
 
+def up(x, params):
+    return (x ** params[0]) * ((1 - x) ** params[1])
+
+def down(x, params):
+    return (x ** params[2]) * ((1 - x) ** params[3])
+
+def advanced_feature_engineering(xs_tensor):
+    log_features = torch.log1p(xs_tensor)
+    symlog_features = torch.sign(xs_tensor) * torch.log1p(xs_tensor.abs())
+
+    ratio_features = []
+    diff_features = []
+    for i in range(xs_tensor.shape[-1]):
+        for j in range(i + 1, xs_tensor.shape[-1]):
+            ratio = xs_tensor[..., i] / (xs_tensor[..., j] + 1e-8)
+            ratio_features.append(torch.log1p(ratio.abs()).unsqueeze(-1))
+            diff = torch.log1p(xs_tensor[..., i]) - torch.log1p(xs_tensor[..., j])
+            diff_features.append(diff.unsqueeze(-1))
+
+    ratio_features = torch.cat(ratio_features, dim=-1)
+    diff_features = torch.cat(diff_features, dim=-1)
+    return torch.cat([log_features, symlog_features, ratio_features, diff_features], dim=-1)
+    
 class RealisticDISSimulator:
     def __init__(self, device=None, smear=True, smear_std=0.05):
         self.device = device or torch.device("cpu")

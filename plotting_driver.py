@@ -8,6 +8,7 @@ from simulator import *
 from models import *
 from torch.distributions import *
 import os
+from simulator import SimplifiedDIS, up, down, advanced_feature_engineering
 
 def plot_loss_curves(loss_dir='.', save_path='loss_plot.png', show_plot=True):
     """
@@ -85,9 +86,6 @@ def plot_loss_curves(loss_dir='.', save_path='loss_plot.png', show_plot=True):
         plt.show()
     plt.close()
 
-
-
-
 def compute_chisq_statistic(true_function, predicted_function):
     """
     Computes the Chi-square statistic between the true function and the predicted function.
@@ -103,7 +101,16 @@ def compute_chisq_statistic(true_function, predicted_function):
     chisq = np.sum(((true_function - predicted_function) ** 2) / (predicted_function + 1e-10))  # Adding small value to avoid division by zero
     return chisq
 
-def evaluate_over_n_samples(model, pointnet_model, n=100, num_events=100000, device=None):
+def evaluate_over_n_parameters(model, pointnet_model, n=100, num_events=100000, device=None):
+    """
+    Evaluate the model over n true parameter samples and compute errors and chi-squared statistics.
+    Args:
+        model: The trained model to evaluate.
+        pointnet_model: The PointNet model for feature extraction.
+        n (int): Number of samples to evaluate.
+        num_events (int): Number of events to simulate for each sample.
+        device: Device to run the evaluation on (CPU or GPU).
+    """     
     device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     simulator = SimplifiedDIS(torch.device('cpu'))
 
@@ -189,81 +196,8 @@ def sample_with_mc_dropout(model, latent_embedding, n_samples=100):
             samples.append(output)
     return torch.stack(samples)
 
-
-def plot_2d_histograms(true_params, generated_params, simulator, num_events=100000, bins=50, device=None):
-    true_events = simulator.sample(true_params, num_events).cpu().numpy()
-    generated_events = simulator.sample(generated_params, num_events).cpu().numpy()
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
-    axes[0].scatter(true_events[:, 0], true_events[:, 1],color='blue', alpha=0.2)
-    axes[0].set_title(r"$\Xi_{\theta^{*}}$")
-    axes[0].set_xlabel("Sigma_p")
-    axes[0].set_ylabel("Sigma_n")
-
-    axes[1].scatter(generated_events[:, 0], generated_events[:, 1], color='orange',alpha=0.2)
-    axes[1].set_title(r"$\Xi_{\hat{\theta}}$")
-    axes[1].set_xlabel("Sigma_p")
-    axes[1].set_ylabel("Sigma_n")
-
-    plt.tight_layout()
-    plt.savefig("histograms.png")
-    plt.show()
-
-def up(x, params):
-    return (x ** params[0]) * ((1 - x) ** params[1])
-
-def down(x, params):
-    return (x ** params[2]) * ((1 - x) ** params[3])
-
-class SimplifiedDIS:
-    def __init__(self, device=None):
-        self.device = device
-
-    def init(self, params):
-        self.Nu = 1
-        self.au = params[0]
-        self.bu = params[1]
-        self.Nd = 2
-        self.ad = params[2]
-        self.bd = params[3]
-
-    def up(self, x):
-        return self.Nu * (x ** self.au) * ((1 - x) ** self.bu)
-
-    def down(self, x):
-        return self.Nd * (x ** self.ad) * ((1 - x) ** self.bd)
-
-    def sample(self, params, nevents=1):
-        self.init(torch.tensor(params, device=self.device))
-
-        xs_p = torch.rand(nevents, device=self.device)
-        sigma_p = 4 * self.up(xs_p) + self.down(xs_p)
-        sigma_p = torch.nan_to_num(sigma_p, nan=0.0)
-
-        xs_n = torch.rand(nevents, device=self.device)
-        sigma_n = 4 * self.down(xs_n) + self.up(xs_n)
-        sigma_n = torch.nan_to_num(sigma_n, nan=0.0)
-
-        return torch.cat([sigma_p.unsqueeze(0), sigma_n.unsqueeze(0)], dim=0).t()
-
-def advanced_feature_engineering(xs_tensor):
-    log_features = torch.log1p(xs_tensor)
-    symlog_features = torch.sign(xs_tensor) * torch.log1p(xs_tensor.abs())
-
-    ratio_features = []
-    diff_features = []
-    for i in range(xs_tensor.shape[-1]):
-        for j in range(i + 1, xs_tensor.shape[-1]):
-            ratio = xs_tensor[..., i] / (xs_tensor[..., j] + 1e-8)
-            ratio_features.append(torch.log1p(ratio.abs()).unsqueeze(-1))
-            diff = torch.log1p(xs_tensor[..., i]) - torch.log1p(xs_tensor[..., j])
-            diff_features.append(diff.unsqueeze(-1))
-
-    ratio_features = torch.cat(ratio_features, dim=-1)
-    diff_features = torch.cat(diff_features, dim=-1)
-    return torch.cat([log_features, symlog_features, ratio_features, diff_features], dim=-1)
-
 def plot_event_histogram(model, pointnet_model, true_params, device, n_mc=100, num_events=100000):
+
     model.eval()
     pointnet_model.eval()
     simulator = SimplifiedDIS(torch.device('cpu'))
@@ -317,77 +251,6 @@ def plot_event_histogram(model, pointnet_model, true_params, device, n_mc=100, n
     plt.tight_layout()
     plt.savefig("histograms.png")
     plt.show()
-
-# def plot_params_distribution_single(model, pointnet_model, true_params, device, n_mc=100, compare_with_sbi=False):
-#     model.eval()
-#     pointnet_model.eval()
-#     simulator = SimplifiedDIS(torch.device('cpu'))
-
-#     true_params = true_params.to(device)
-#     xs = simulator.sample(true_params.cpu(), 100000).to(device)
-#     xs_tensor = torch.tensor(xs, dtype=torch.float32, device=device)
-#     xs_tensor = advanced_feature_engineering(xs_tensor)
-#     latent_embedding = pointnet_model(xs_tensor.unsqueeze(0))
-
-#     samples = sample_with_mc_dropout(model, latent_embedding, n_samples=n_mc).squeeze()
-
-#     fig, axes = plt.subplots(1, true_params.size(0), figsize=(20, 4))
-#     for i in range(true_params.size(0)):
-#         axes[i].hist(samples[:, i].cpu().numpy(), bins=20, alpha=0.7, color='skyblue')
-#         axes[i].axvline(true_params[i].item(), color='red', linestyle='dashed', label='True Value')
-#         axes[i].set_title(f'Param {i+1}')
-#         axes[i].legend()
-
-#     plt.tight_layout()
-#     plt.savefig("Dist.png")
-#     plt.show()
-
-# def plot_params_distribution_single(
-#     model,
-#     pointnet_model,
-#     true_params,
-#     device,
-#     n_mc=100,
-#     compare_with_sbi=False,
-#     sbi_posteriors=None,  # list of tensors
-#     sbi_labels=None       # list of strings
-# ):
-#     model.eval()
-#     pointnet_model.eval()
-#     simulator = SimplifiedDIS(torch.device('cpu'))
-
-#     true_params = true_params.to(device)
-
-#     # Simulate data + feature engineering
-#     xs = simulator.sample(true_params.cpu(), 100000).to(device)
-#     xs_tensor = torch.tensor(xs, dtype=torch.float32, device=device)
-#     xs_tensor = advanced_feature_engineering(xs_tensor)
-#     latent_embedding = pointnet_model(xs_tensor.unsqueeze(0))
-
-#     # MC Dropout samples
-#     samples = sample_with_mc_dropout(model, latent_embedding, n_samples=n_mc).squeeze()
-
-#     # Plotting
-#     fig, axes = plt.subplots(1, true_params.size(0), figsize=(4 * true_params.size(0), 4))
-
-#     for i in range(true_params.size(0)):
-#         # MC Dropout histogram
-#         axes[i].hist(samples[:, i].cpu().numpy(), bins=20, alpha=0.5, color='skyblue', label='MC Dropout')
-
-#         # Overlay SBI posteriors if provided
-#         if compare_with_sbi and sbi_posteriors is not None and sbi_labels is not None:
-#             colors = ['orange', 'green', 'purple', 'gray']
-#             for j, sbi_samples in enumerate(sbi_posteriors):
-#                 axes[i].hist(sbi_samples[:, i].cpu().numpy(), bins=20, alpha=0.4, color=colors[j % len(colors)], label=sbi_labels[j])
-
-#         # True value
-#         axes[i].axvline(true_params[i].item(), color='red', linestyle='dashed', label='True Value')
-#         axes[i].set_title(f'Param {i+1}')
-#         axes[i].legend()
-
-#     plt.tight_layout()
-#     plt.savefig("Dist.png")
-#     plt.show()
 
 def plot_params_distribution_single(
     model,
@@ -462,6 +325,15 @@ def plot_params_distribution_single(
     plt.show()
 
 def plot_PDF_distribution_single(model, pointnet_model, true_params, device, n_mc=100):
+    """
+    Plot the PDF distribution of the model's predictions compared to the true parameters.
+    Args:
+        model: The trained model to evaluate.
+        pointnet_model: The PointNet model for feature extraction (stage 2).
+        true_params: True parameters for the simulator.
+        device: Device to run the evaluation on (CPU or GPU).
+        n_mc (int): Number of Monte Carlo samples to draw.
+    """
     model.eval()
     pointnet_model.eval()
     simulator = SimplifiedDIS(torch.device('cpu'))
@@ -580,9 +452,6 @@ def plot_PDF_distribution_single(model, pointnet_model, true_params, device, n_m
     plt.savefig("down.png")
     plt.close(fig_down)
 
-
-
-
 # Load the model and data
 def load_model_and_data(model_path, pointnet_model_path, num_samples=100, num_events=10000, device=None):
     # Ensure the device is set
@@ -596,7 +465,6 @@ def load_model_and_data(model_path, pointnet_model_path, num_samples=100, num_ev
 
     # Instantiate the models
     latent_dim = 256  # Example latent dimension
-    # model = ImprovedMDN(latent_dim, 4)  # Parameter dimension is 4
     model = InferenceNet(embedding_dim=latent_dim).to(device)
     pointnet_model = PointNetPMA(input_dim=input_dim, latent_dim=latent_dim)
     state_dict = torch.load(pointnet_model_path)
@@ -644,8 +512,6 @@ def load_model_and_data(model_path, pointnet_model_path, num_samples=100, num_ev
                             collate_fn=EventDataset.collate_fn, num_workers=0, pin_memory=True, persistent_workers=False)
     
     inference_net = InferenceNet(embedding_dim=latent_dim).to(device)
-    # dataset = EventDataset(xs_tensor_engineered.to(device), thetas.to(device), pointnet_model.to(device), device)
-    # dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
 
     return model, pointnet_model, dataloader, device
 
@@ -653,28 +519,34 @@ def load_model_and_data(model_path, pointnet_model_path, num_samples=100, num_ev
 def main():
     model_path = 'final_inference_net.pth'  # Path to the trained model
     pointnet_model_path = 'final_model.pth'  # Path to the pretrained PointNet model
-    multi_log=True
-    log=False
+    # TODO: add RealisticDIS support
+    n_mc=100
     # Load the model and data
     model, pointnet_model, dataloader, device = load_model_and_data(model_path, pointnet_model_path)
     true_params = torch.tensor([1.0, 0.5, 1.2, 0.5])
     # plot_params_distribution_single(model, pointnet_model, true_params, device, n_mc=100)
+    # Load approximate posteriors generated with SBI methods
     samples_snpe = torch.tensor(np.loadtxt("samples_snpe.txt"), dtype=torch.float32)
     samples_wass = torch.tensor(np.loadtxt("samples_wasserstein.txt"), dtype=torch.float32)
     samples_mmd = torch.tensor(np.loadtxt("samples_mmd.txt"), dtype=torch.float32)
+    # Plot the results
     plot_params_distribution_single(
     model=model,
     pointnet_model=pointnet_model,
     true_params=true_params,
     device=device,
-    n_mc=100,
+    n_mc=n_mc,
     compare_with_sbi=True,
     sbi_posteriors=[samples_snpe, samples_mmd, samples_wass],
     sbi_labels=["SNPE", "MCABC", "Wasserstein MCABC"]
     )
-    plot_PDF_distribution_single(model, pointnet_model, true_params, device, n_mc=100)
-    plot_event_histogram(model, pointnet_model, true_params, device, n_mc=100, num_events=1000000)
+    # Plot the distribution over PDFs and obtain median PDF
+    plot_PDF_distribution_single(model, pointnet_model, true_params, device, n_mc=n_mc)
+    # Plot the event histograms (cross-sections)
+    plot_event_histogram(model, pointnet_model, true_params, device, n_mc=n_mc, num_events=1000000)
+    # Plot the loss curves
     plot_loss_curves()
-    evaluate_over_n_samples(model, pointnet_model, n=100, num_events=100000, device=device)
+    # Evaluate the model over n true parameters and compute errors and chi-squared statistics
+    evaluate_over_n_parameters(model, pointnet_model, n=n_mc, num_events=100000, device=device)
 if __name__ == "__main__":
     main()
