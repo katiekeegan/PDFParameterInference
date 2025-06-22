@@ -13,72 +13,25 @@ import wandb
 
 from models import PointNetPMA
 
-class RealisticDISSimulator:
-    def __init__(self, device=None, smear=True, smear_std=0.05):
-        self.device = device or torch.device("cpu")
-        self.smear = smear
-        self.smear_std = smear_std
-        self.Q0_squared = 1.0  # GeV^2 reference scale
-        self.params = None
-
-    def __call__(self, params, nevents=1000):
-        return self.sample(params, nevents)
-
-    def init(self, params):
-        # Accepts raw list or tensor of 6 params: [logA0, delta, a, b, c, d]
-        p = torch.tensor(params, dtype=torch.float32, device=self.device)
-        self.logA0 = p[0]
-        self.delta = p[1]
-        self.a = p[2]
-        self.b = p[3]
-        self.c = p[4]
-        self.d = p[5]
-
-    def q(self, x, Q2):
-        A0 = torch.exp(self.logA0)
-        scale_factor = (Q2 / self.Q0_squared).clamp(min=1e-6)
-        A_Q2 = A0 * scale_factor ** self.delta
-        shape = x.clamp(min=1e-6, max=1.0)**self.a * (1 - x.clamp(min=0.0, max=1.0))**self.b
-        poly = 1 + self.c * x + self.d * x**2
-        shape = shape * poly.clamp(min=1e-6)  # avoid negative polynomial tail
-        return A_Q2 * shape
-
-    def F2(self, x, Q2):
-        return x * self.q(x, Q2)
-
-    def sample(self, params, nevents=1000, x_range=(1e-3, 0.9), Q2_range=(1.0, 1000.0)):
-        self.init(params)
-
-        # Sample x ~ Uniform, Q2 ~ LogUniform
-        x = torch.rand(nevents, device=self.device) * (x_range[1] - x_range[0]) + x_range[0]
-        logQ2 = torch.rand(nevents, device=self.device) * (
-            np.log10(Q2_range[1]) - np.log10(Q2_range[0])
-        ) + np.log10(Q2_range[0])
-        Q2 = 10 ** logQ2
-
-        f2 = self.F2(x, Q2)
-
-        if self.smear:
-            noise = torch.randn_like(f2) * (self.smear_std * f2)
-            f2 = f2 + noise
-            f2f = f2.clamp(min=1e-6)
-
-        return torch.stack([x, Q2, f2], dim=1)  # shape: [nevents, 3]s
+from simulator import RealisticDIS
 
 class SimplifiedDIS:
     def __init__(self, device=None, smear=False, smear_std=0.05):
         self.device = device
         self.smear = smear
         self.smear_std = smear_std
+        self.Nu = 1
+        self.Nd = 2
+        self.au, self.bu, self.ad, self.bd = None, None, None, None
 
     def init(self, params):
         self.au, self.bu, self.ad, self.bd = [p.to(self.device) for p in params]
 
     def up(self, x):
-        return (x ** self.au) * ((1 - x) ** self.bu)
+        return self.Nu * (x ** self.au) * ((1 - x) ** self.bu)
 
     def down(self, x):
-        return (x ** self.ad) * ((1 - x) ** self.bd)
+        return self.Nd * (x ** self.ad) * ((1 - x) ** self.bd)
 
     def sample(self, params, nevents=1):
         self.init(params)
@@ -88,7 +41,9 @@ class SimplifiedDIS:
 
         xs_p, xs_n = rand(), rand()
         sigma_p = smear_noise(4 * self.up(xs_p) + self.down(xs_p))
+        sigma_p = torch.nan_to_num(sigma_p, nan=0.0, posinf=1e8, neginf=0.0)
         sigma_n = smear_noise(4 * self.down(xs_n) + self.up(xs_n))
+        sigma_n = torch.nan_to_num(sigma_n, nan=0.0, posinf=1e8, neginf=0.0)
         return torch.stack([sigma_p, sigma_n], dim=-1)
 
 
@@ -113,7 +68,7 @@ class DISDataset(IterableDataset):
             xs = []
             for _ in range(self.n_repeat):
                 x = self.simulator.sample(theta, self.num_events)
-                xs.append(feature_engineering(x).cpu())
+                xs.append(log_feature_engineering(x).cpu())
 
             yield theta.cpu(), torch.stack(xs)  # [n_repeat, num_points, feature_dim]
 
@@ -169,30 +124,6 @@ class RealisticDISDataset(IterableDataset):
                 xs.append(self.feature_engineering(x).cpu())       # e.g., log(x), normalize, etc.
 
             yield theta.cpu(), torch.stack(xs)  # shape: [n_repeat, num_events, feature_dim]
-
-# Feature Engineering with improved stability
-def feature_engineering(xs_tensor):
-    # Basic features with clamping for numerical stability
-    xs_clamped = torch.clamp(xs_tensor, min=1e-8, max=1e8)
-    del xs_tensor
-    log_features = torch.log1p(xs_clamped)
-    symlog_features = torch.sign(xs_clamped) * torch.log1p(xs_clamped.abs())
-
-    # Pairwise features with vectorized operations
-    n_features = xs_clamped.shape[-1]
-    # del xs_tensor
-    combinations = torch.combinations(torch.arange(n_features), r=2)
-    i, j = combinations[:, 0], combinations[:, 1]
-    del combinations
-    # Safe division with clamping
-    ratio = xs_clamped[..., i] / (xs_clamped[..., j] + 1e-8)
-    ratio_features = torch.log1p(ratio.abs())
-    del ratio
-    
-    diff_features = torch.log1p(xs_clamped[..., i]) - torch.log1p(xs_clamped[..., j])
-    del xs_clamped
-    data = torch.cat([log_features, symlog_features, ratio_features, diff_features], dim=-1)
-    return data
 
 def contrastive_loss_fn(z, theta, temperature=0.1, sim_threshold=0.15, dissim_threshold=0.35, margin=1.0, scale=2.0):
     # Normalize latent set-level embeddings
@@ -273,15 +204,11 @@ def triplet_theta_contrastive_loss(z, theta, margin=0.5, sim_threshold=0.05, dis
 
     return torch.cat(losses).mean()
 
-def train(model, dataloader, epochs, lr, rank, wandb_enabled):
+def train(model, dataloader, epochs, lr, rank, wandb_enabled, output_dir):
     device = next(model.parameters()).device
     opt = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     scaler = torch.cuda.amp.GradScaler()
     alpha1, alpha2 = 0.01, 0.01
-
-    if wandb_enabled and rank == 0:
-        import wandb
-        wandb.init(project="quantom_cl")
 
     for epoch in range(epochs):
         model.train()
@@ -294,7 +221,7 @@ def train(model, dataloader, epochs, lr, rank, wandb_enabled):
             theta, x_sets = theta.to(device), x_sets.to(device)
             opt.zero_grad()
             with torch.cuda.amp.autocast():
-                latent = model(x_sets)  # [B*n_repeat, latent_dim]
+                latent = model(x_sets)
                 contrastive = triplet_theta_contrastive_loss(latent, theta)
 
                 l2_reg = latent.norm(p=2, dim=1).mean()
@@ -310,11 +237,13 @@ def train(model, dataloader, epochs, lr, rank, wandb_enabled):
             total_loss += loss.item()
 
         if rank == 0:
-            wandb.log({"epoch": epoch + 1, "loss": total_loss})
+            if wandb_enabled:
+                wandb.log({"epoch": epoch + 1, "loss": total_loss})
             print(f"Epoch {epoch+1}, Loss: {total_loss:.4f}")
+            torch.save(model.state_dict(), os.path.join(output_dir, "most_recent_model.pth"))
 
     if rank == 0:
-        torch.save(model.state_dict(), "final_model.pth")
+        torch.save(model.state_dict(), os.path.join(output_dir, "final_model.pth"))
 
 
 
@@ -333,43 +262,53 @@ def cleanup():
 def main_worker(rank, world_size, args):
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
+
+    # Generate experiment name if not provided
+    if args.experiment_name is None:
+        args.experiment_name = f"{args.problem}_latent{args.latent_dim}_ns_{args.num_samples}_ne_{args.num_events}"
+
+    # Define output directory and create it
+    output_dir = os.path.join("experiments", args.experiment_name)
+    os.makedirs(output_dir, exist_ok=True)
+
     if args.problem == 'simplified_dis':
         simulator = SimplifiedDIS(device=device)
         dataset = DISDataset(simulator, args.num_samples, args.num_events, rank, world_size)
         input_dim = 4
     elif args.problem == 'realistic_dis':
-        simulator = RealisticDISSimulator(device=device, smear=True, smear_std=0.05)
+        simulator = RealisticDIS(device=device, smear=True, smear_std=0.05)
         print("Simulator constructed!")
-        dataset = RealisticDISDataset(simulator, args.num_samples, args.num_events, rank, world_size, feature_engineering=feature_engineering)
+        dataset = RealisticDISDataset(simulator, args.num_samples, args.num_events, rank, world_size, feature_engineering=log_feature_engineering)
         print("Dataset created!")
         input_dim = 6
+
     dataloader = DataLoader(dataset, batch_size=args.batch_size, num_workers=4, pin_memory=True)
     dummy_theta = torch.rand(input_dim, device=device)
     dummy_x = simulator.sample(dummy_theta, args.num_events)
-    print(f"dummy_theta: {dummy_theta}")
-    print(f"dummy_x: {dummy_x}")
-    input_dim = feature_engineering(dummy_x).shape[-1]
+    input_dim = log_feature_engineering(dummy_x).shape[-1]
+
     model = PointNetPMA(input_dim=input_dim, latent_dim=args.latent_dim, predict_theta=True).to(device)
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model = DDP(model, device_ids=[rank])
- 
-    if rank == 0 and args.wandb:
-        wandb.init(project="quantom_cl", config=vars(args))
 
-    train(model, dataloader, args.num_epochs, args.lr, rank, True)
+    if rank == 0 and args.wandb:
+        wandb.init(project="quantom_cl", name=args.experiment_name, config=vars(args))
+
+    train(model, dataloader, args.num_epochs, args.lr, rank, args.wandb, output_dir)
     cleanup()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--num_samples', type=int, default=10000)
-    parser.add_argument('--num_events', type=int, default=100000)
+    parser.add_argument('--num_events', type=int, default=500000)
     parser.add_argument('--num_epochs', type=int, default=200)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--latent_dim', type=int, default=256)
+    parser.add_argument('--latent_dim', type=int, default=1024)
     parser.add_argument('--problem', type=str, default='simplified_dis')
     parser.add_argument('--wandb', action='store_true')
+    parser.add_argument('--experiment_name', type=str, default=None, help='Unique name for this ablation run')
     args = parser.parse_args()
 
     world_size = torch.cuda.device_count()

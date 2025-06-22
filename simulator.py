@@ -56,7 +56,7 @@ def advanced_feature_engineering(xs_tensor):
     diff_features = torch.cat(diff_features, dim=-1)
     return torch.cat([log_features, symlog_features, ratio_features, diff_features], dim=-1)
     
-class RealisticDISSimulator:
+class RealisticDIS:
     def __init__(self, device=None, smear=True, smear_std=0.05):
         self.device = device or torch.device("cpu")
         self.smear = smear
@@ -79,9 +79,11 @@ class RealisticDISSimulator:
 
     def q(self, x, Q2):
         A0 = torch.exp(self.logA0)
-        scale = (Q2 / self.Q0_squared).clamp(min=1e-6)
-        A_Q2 = A0 * scale ** self.delta
-        shape = x ** self.a * (1 - x) ** self.b * (1 + self.c * x + self.d * x ** 2)
+        scale_factor = (Q2 / self.Q0_squared).clamp(min=1e-6)
+        A_Q2 = A0 * scale_factor ** self.delta
+        shape = x.clamp(min=1e-6, max=1.0)**self.a * (1 - x.clamp(min=0.0, max=1.0))**self.b
+        poly = 1 + self.c * x + self.d * x**2
+        shape = shape * poly.clamp(min=1e-6)  # avoid negative polynomial tail
         return A_Q2 * shape
 
     def F2(self, x, Q2):
@@ -100,6 +102,8 @@ class RealisticDISSimulator:
         f2 = self.F2(x, Q2)
 
         if self.smear:
-            f2 = f2 + self.smear_std * f2 * torch.randn_like(f2)
+            noise = torch.randn_like(f2) * (self.smear_std * f2)
+            f2 = f2 + noise
+            f2f = f2.clamp(min=1e-6)
 
         return torch.stack([x, Q2, f2], dim=1)  # shape: [nevents, 3]

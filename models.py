@@ -6,15 +6,15 @@ import torch.nn.functional as F
 import math
 from torch.nn.utils import spectral_norm as sn
 from torch.nn import MultiheadAttention
-from nflows.transforms import (
-    CompositeTransform,
-    ReversePermutation,
-    MaskedAffineAutoregressiveTransform
-)
-from nflows.distributions import StandardNormal
-from nflows.flows import Flow
+# from nflows.transforms import (
+#     CompositeTransform,
+#     ReversePermutation,
+#     MaskedAffineAutoregressiveTransform
+# )
+# from nflows.distributions import StandardNormal
+# from nflows.flows import Flow
 class InferenceNet(nn.Module):
-    def __init__(self, embedding_dim, hidden_dim=512):
+    def __init__(self, embedding_dim, output_dim = 6, hidden_dim=512):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(embedding_dim, hidden_dim),
@@ -28,13 +28,9 @@ class InferenceNet(nn.Module):
             nn.Dropout(0.5),
             nn.Linear(hidden_dim, hidden_dim//2),
             nn.ReLU(),
-            nn.Linear(hidden_dim//2, 4)  # Output raw (unconstrained) parameters
+            nn.Linear(hidden_dim//2, output_dim)  # Output raw (unconstrained) parameters
         )
         self._init_weights()
-        
-        # Parameter ranges: [au, bu, ad, bd]
-        self.param_mins = torch.tensor([0.0, 0.0, 0.0, 0.0])
-        self.param_maxs = torch.tensor([5, 5, 5, 5])
         
     def _init_weights(self):
         for m in self.modules():
@@ -45,25 +41,6 @@ class InferenceNet(nn.Module):
     def forward(self, z):
         # Get raw network output
         params = self.net(z)
-        
-        # # Apply constraints to each parameter
-        # params = torch.zeros_like(raw_params)
-        #         #         [0.1, 5],
-        #         # [-1, -0.5],
-        #         # [0.1, 5],
-        #         # [-1, -0.5],
-        
-        # # au (0.1, 5) - use sigmoid then scale
-        # params[:, 0] = 0.1 + (5.0 - 0.1) * torch.sigmoid(raw_params[:, 0])
-        
-        # # bu (-1, -0.1) - use sigmoid then scale to negative range
-        # params[:, 1] =-1.0 + (-0.5 - (-1.0)) * torch.sigmoid(raw_params[:, 1])
-        
-        # # ad (0.1, 5) - same as au
-        # params[:, 2] = 0.1 + (5.0 - 0.1) * torch.sigmoid(raw_params[:, 2])
-        
-        # # bd (-1, -0.5) - similar to bu but different range
-        # params[:, 3] = -1.0 + (-0.5 - (-1.0)) * torch.sigmoid(raw_params[:, 3])
         
         return params
 
