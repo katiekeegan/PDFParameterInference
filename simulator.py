@@ -2,6 +2,28 @@ import torch
 from torch.distributions import Uniform, Distribution
 import numpy as np
 
+class Gaussian2DSimulator:
+    """
+    Unimodal 2D Gaussian simulator with 1D parameter vector input.
+    Parameter vector: [mu_x, mu_y, sigma_x, sigma_y, rho]
+    """
+    def __init__(self, device=None):
+        self.device = device or torch.device("cpu")
+
+    def sample(self, theta, nevents=1000):
+        """
+        theta: torch.tensor of shape (5,) -- [mu_x, mu_y, sigma_x, sigma_y, rho]
+        Returns: torch.tensor of shape (nevents, 2)
+        """
+        mu_x, mu_y, sigma_x, sigma_y, rho = theta
+        mean = torch.tensor([mu_x, mu_y], device=self.device)
+        cov = torch.tensor([
+            [sigma_x**2, rho * sigma_x * sigma_y],
+            [rho * sigma_x * sigma_y, sigma_y**2]
+        ], device=self.device)
+        samples = torch.distributions.MultivariateNormal(mean, cov).sample((nevents,))
+        return samples
+
 class SimplifiedDIS:
     def __init__(self, device=None):
         self.device = device

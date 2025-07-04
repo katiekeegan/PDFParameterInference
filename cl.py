@@ -10,10 +10,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import wandb
+from datasets import *
+from utils import *
 
 from models import PointNetPMA
 
-from simulator import RealisticDIS
+from simulator import RealisticDIS, Gaussian2DSimulator
 
 class SimplifiedDIS:
     def __init__(self, device=None, smear=False, smear_std=0.05):
@@ -45,85 +47,6 @@ class SimplifiedDIS:
         sigma_n = smear_noise(4 * self.down(xs_n) + self.up(xs_n))
         sigma_n = torch.nan_to_num(sigma_n, nan=0.0, posinf=1e8, neginf=0.0)
         return torch.stack([sigma_p, sigma_n], dim=-1)
-
-
-class DISDataset(IterableDataset):
-    def __init__(self, simulator, num_samples, num_events, rank, world_size, theta_dim=4, n_repeat=2):
-        self.simulator = simulator
-        self.num_samples = num_samples // world_size
-        self.num_events = num_events
-        self.rank = rank
-        self.world_size = world_size
-        self.theta_bounds = torch.tensor([[0.0, 5]] * theta_dim)
-        self.n_repeat = n_repeat
-
-    def __iter__(self):
-        device = torch.device(f"cuda:{self.rank}")
-        self.simulator.device = device
-        theta_bounds = self.theta_bounds.to(device)
-
-        for _ in range(self.num_samples):
-            theta = torch.rand(theta_bounds.size(0), device=device)
-            theta = theta * (theta_bounds[:, 1] - theta_bounds[:, 0]) + theta_bounds[:, 0]
-            xs = []
-            for _ in range(self.n_repeat):
-                x = self.simulator.sample(theta, self.num_events)
-                xs.append(log_feature_engineering(x).cpu())
-
-            yield theta.cpu(), torch.stack(xs)  # [n_repeat, num_points, feature_dim]
-
-class RealisticDISDataset(IterableDataset):
-    def __init__(
-        self,
-        simulator,
-        num_samples,
-        num_events,
-        rank,
-        world_size,
-        theta_dim=6,        # logA0, delta, a, b, c, d
-        theta_bounds=None,  # custom bounds (optional)
-        n_repeat=2,
-        feature_engineering=None,
-    ):
-        self.simulator = simulator
-        self.num_samples = num_samples // world_size
-        self.num_events = num_events
-        self.rank = rank
-        self.world_size = world_size
-        self.theta_dim = theta_dim
-        self.n_repeat = n_repeat
-
-        if theta_bounds is None:
-            # Default bounds per parameter: adjust based on physical priors
-            self.theta_bounds = torch.tensor([
-                [-2.0, 2.0],   # logA0
-                [-1.0, 1.0],   # delta
-                [0.0, 5.0],    # a
-                [0.0, 10.0],   # b
-                [-5.0, 5.0],   # c
-                [-5.0, 5.0],   # d
-            ])
-        else:
-            self.theta_bounds = torch.tensor(theta_bounds)
-
-        self.feature_engineering = feature_engineering# or (lambda x: x)
-
-    def __iter__(self):
-        device = torch.device(f"cuda:{self.rank}" if torch.cuda.is_available() else "cpu")
-        self.simulator.device = device
-        theta_bounds = self.theta_bounds.to(device)
-
-        for _ in range(self.num_samples):
-            theta = torch.rand(self.theta_dim, device=device)
-            theta = theta * (theta_bounds[:, 1] - theta_bounds[:, 0]) + theta_bounds[:, 0]
-
-            xs = []
-            for _ in range(self.n_repeat):
-                # Sample events from the simulator
-                x = self.simulator.sample(theta, self.num_events)  # shape: [num_events, 3]
-                xs.append(self.feature_engineering(x).cpu())       # e.g., log(x), normalize, etc.
-
-            yield theta.cpu(), torch.stack(xs)  # shape: [n_repeat, num_events, feature_dim]
 
 def contrastive_loss_fn(z, theta, temperature=0.1, sim_threshold=0.15, dissim_threshold=0.35, margin=1.0, scale=2.0):
     # Normalize latent set-level embeddings
@@ -281,11 +204,18 @@ def main_worker(rank, world_size, args):
         dataset = RealisticDISDataset(simulator, args.num_samples, args.num_events, rank, world_size, feature_engineering=log_feature_engineering)
         print("Dataset created!")
         input_dim = 6
+    elif args.problem == 'gaussian':
+        simulator = Gaussian2DSimulator(device=device)
+        dataset = Gaussian2DDataset(
+        simulator, args.num_samples, args.num_events, rank, world_size
+        )
+        input_dim = 2
 
     dataloader = DataLoader(dataset, batch_size=args.batch_size, num_workers=4, pin_memory=True)
-    dummy_theta = torch.rand(input_dim, device=device)
-    dummy_x = simulator.sample(dummy_theta, args.num_events)
-    input_dim = log_feature_engineering(dummy_x).shape[-1]
+    if not (args.problem == 'gaussian'):
+        dummy_theta = torch.rand(input_dim, device=device)
+        dummy_x = simulator.sample(dummy_theta, args.num_events)
+        input_dim = log_feature_engineering(dummy_x).shape[-1]
 
     model = PointNetPMA(input_dim=input_dim, latent_dim=args.latent_dim, predict_theta=True).to(device)
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)

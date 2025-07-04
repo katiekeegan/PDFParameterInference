@@ -18,38 +18,6 @@ from utils import log_feature_engineering
 # Suppress numerical warnings
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
-
-class InferenceNet(nn.Module):
-    def __init__(self, embedding_dim, output_dim = 6, hidden_dim=512):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(embedding_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(hidden_dim, hidden_dim//2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim//2, output_dim)  # Output raw (unconstrained) parameters
-        )
-        self._init_weights()
-        
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
-                nn.init.constant_(m.bias, 0)
-
-    def forward(self, z):
-        # Get raw network output
-        params = self.net(z)
-        
-        return params
-
 # SimplifiedDIS class with improved numerical stability
 class SimplifiedDIS:
     def __init__(self, device=None, smear=False, smear_std=0.05):
